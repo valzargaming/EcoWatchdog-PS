@@ -10,13 +10,13 @@ Describe 'Repair flow with restore on failure' {
     It 'attempts Restore-LatestBackup when Start-Eco fails initially' {
         # Prepare mocks: Start-Eco fails, Restore-LatestBackup recorded
         Mock -CommandName Start-Eco { Set-State 'FAILED' }
-        Mock -CommandName Restore-LatestBackup { } -Verifiable
+        Mock -CommandName Restore-Database { } -Verifiable
 
-        # Run Repair-Eco
-        Repair-Eco
+        # Run Repair-Server (approved verb wrapper)
+        Repair-Server
 
         # Assert restore called
-        Assert-MockCalled -CommandName Restore-LatestBackup -Times 1
+        Assert-MockCalled -CommandName Restore-Database -Times 1
     }
 }
 
@@ -33,12 +33,12 @@ Describe 'Backup and Restore real files in temp dir' {
         $Config.DbPath = $origDb; $Config.BackupDir = $backupDir
 
         Set-Content -Path $origDb -Value 'good-db'
-        $b = Backup-DB
+        $b = Backup-Database
         Test-Path $b | Should Be $true
 
         # corrupt original
         Set-Content -Path $origDb -Value 'corrupt'
-        Restore-LatestBackup
+        Restore-Database
         (Get-Content $origDb -Raw) | Should Match 'good-db'
 
         # cleanup

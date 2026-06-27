@@ -1,0 +1,33 @@
+name: Pester — Approved Verbs
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    name: Pester Approved Verbs on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          # Install to current user to avoid requiring admin privileges on hosted runners
+          Install-Module -Name Pester -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Run Approved Verbs tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -ErrorAction Stop
+          Invoke-Pester -Script tests/ApprovedVerbs.Tests.ps1 -EnableExit

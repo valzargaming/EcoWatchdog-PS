@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Production-ready Eco server watchdog.
 
@@ -43,6 +43,23 @@
 # ------------------------------
 $ScriptDir      = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# If running under Windows PowerShell (v5) and PowerShell 7 ('pwsh') is available,
+# re-invoke this script under pwsh for better cross-platform behavior.
+try {
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+        if ($pwsh) {
+            Write-Host "PowerShell 7 detected at $($pwsh.Path). Re-launching under pwsh..." -ForegroundColor Yellow
+            & $pwsh.Path -NoProfile -File $MyInvocation.MyCommand.Path @args
+            Exit
+        } else {
+            Write-Host 'PowerShell 7 (pwsh) not found; continuing under current host.' -ForegroundColor Yellow
+        }
+    }
+} catch {
+    # If anything goes wrong, continue under current host
+}
+
 $Config = [ordered]@{
     EcoExe                   = Join-Path $ScriptDir 'EcoServer.exe'
     DbPath                   = Join-Path $ScriptDir 'Storage.db'
@@ -65,11 +82,33 @@ $Config = [ordered]@{
     RconPassword             = $null
     RconProtocol             = 'auto'  # 'auto'|'plain'|'source'
     RconConnectTimeoutMs     = 3000
+    # World/save name loaded from Configs/Storage.eco (e.g. "Game-2026-06-27-10.59.01")
+    WorldSaveName            = $null
+    # Storage directory name (relative to script dir), read from Storage.eco StorageDirectory
+    StorageDirectory         = 'Storage'
 }
 
+# UI key bindings (configurable): map console key name -> action token
+$Config.KeyBindings = [ordered]@{
+    H = @{ Action = 'Health'; Label = 'Health' }
+    R = @{ Action = 'Repair'; Label = 'Repair' }
+    S = @{ Action = 'Stop';   Label = 'Stop' }
+    A = @{ Action = 'Start';  Label = 'Start' }
+    L = @{ Action = 'Logs';   Label = 'Logs' }
+    B = @{ Action = 'Back';   Label = 'Back' }
+    Q = @{ Action = 'Quit';   Label = 'Quit' }
+}
+
+# Preferred display order for controls is derived from the KeyBindings keys
+$Config.KeyDisplayOrder = @($Config.KeyBindings.Keys)
+
+# Minimal logging stub so early initialization can call Write-Log
+function Write-Log { param([string]$message, [string]$level = 'INFO')
+    try { Add-Content -Path $Config.LogFile -Value ("[$((Get-Date).ToString('s'))] [$level] $message") -ErrorAction SilentlyContinue } catch {}
+}
+# ------------------------------
 # Ensure directories exist
 if (-not (Test-Path $Config.BackupDir)) { New-Item -ItemType Directory -Path $Config.BackupDir | Out-Null }
-
 # Load RCON password from server network configuration if present.
 # This keeps secrets in the server config and avoids environment/local files.
 if (-not $Config.RconPassword) {
@@ -85,6 +124,32 @@ if (-not $Config.RconPassword) {
     }
 }
 
+# Load world/save name from Configs/Storage.eco so the watchdog knows current world
+function Import-StorageSaveName {
+    $storageCfg = Join-Path $ScriptDir 'Configs\Storage.eco'
+    if (-not (Test-Path $storageCfg)) { return }
+    try {
+        $raw = Get-Content -Path $storageCfg -Raw -ErrorAction Stop
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        if ($obj.SaveName) {
+            $Config.WorldSaveName = $obj.SaveName
+            Write-Log "Loaded SaveName from Configs/Storage.eco: $($Config.WorldSaveName)" 'DEBUG'
+        } elseif ($obj.WorldName) {
+            $Config.WorldSaveName = $obj.WorldName
+            Write-Log "Loaded WorldName from Configs/Storage.eco: $($Config.WorldSaveName)" 'DEBUG'
+        }
+        if ($obj.StorageDirectory) {
+            $Config.StorageDirectory = $obj.StorageDirectory
+            Write-Log "Loaded StorageDirectory from Configs/Storage.eco: $($Config.StorageDirectory)" 'DEBUG'
+        }
+    } catch {
+        Write-Log "Failed parsing Storage.eco for save name: $_" 'WARN'
+    }
+}
+
+# Initial load
+Import-StorageSaveName
+
 # ------------------------------
 # State machine
 # ------------------------------
@@ -93,6 +158,13 @@ enum EcoState { STOPPED; STARTING; RUNNING; STOPPING; RECOVERING; FAILED }
 $global:State = [EcoState]::STOPPED
 $global:EcoProcess = $null
 $global:LastHealth = 'UNKNOWN'
+# When true the watchdog will not auto-restart the server (explicit manual stop)
+$global:ManualStopped = $false
+# Scheduled events (DateTime or $null)
+$global:ScheduledStart = $null
+$global:ScheduledMaintenance = $null
+$global:ScheduledMaintenanceReason = $null
+$global:ShouldQuit = $false
 
 # ------------------------------
 # Logging with rotation
@@ -272,7 +344,13 @@ function Set-State { param($new)
 
 function Start-Eco {
     if ($global:State -in @([EcoState]::RUNNING, [EcoState]::STARTING)) { return }
+    # Clear manual-stop when attempting an explicit start
+    $global:ManualStopped = $false
+        # Clear any scheduled start because we're starting now
+        $global:ScheduledStart = $null
     Set-State [EcoState]::STARTING
+    # Reload the world/save name from disk whenever we start or attach
+    Import-StorageSaveName
     Push-Location $ScriptDir
     try {
         $existing = Get-EcoProcess
@@ -280,6 +358,8 @@ function Start-Eco {
             $global:EcoProcess = Get-Process -Id $existing.ProcessId -ErrorAction SilentlyContinue
             Set-State [EcoState]::RUNNING
             Write-Log "Attached to existing Eco PID $($existing.ProcessId)"
+                # If an attached process exists, clear scheduled start
+                $global:ScheduledStart = $null
             return
         }
         $p = Start-Process -FilePath $Config.EcoExe -PassThru
@@ -290,7 +370,7 @@ function Start-Eco {
     } catch { Write-Log "Start-Eco failed: $_" 'ERROR'; Set-State [EcoState]::FAILED } finally { Pop-Location }
 }
 
-function Backup-DB {
+function Backup-Database {
     if (-not (Test-Path $Config.DbPath)) { Write-Log 'No DB to backup' 'WARN'; return $null }
     $stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
     $dest = Join-Path $Config.BackupDir "Storage_$stamp.db"
@@ -299,15 +379,70 @@ function Backup-DB {
     return $dest
 }
 
-function Restore-LatestBackup {
-    $latest = Get-ChildItem $Config.BackupDir -Filter '*.db' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $latest) { Write-Log 'No backup available' 'WARN'; return }
-    Copy-Item $latest.FullName $Config.DbPath -Force
-    Write-Log "Restored DB from $($latest.Name)"
+function Restore-Database {
+    # First, look in the watchdog backup dir for backups created by this script
+    $latest = Get-ChildItem $Config.BackupDir -Filter '*.db' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($latest) {
+        Copy-Item $latest.FullName $Config.DbPath -Force
+        Write-Log "Restored DB from $($latest.Name) (watchdog backup)"
+        return
+    }
+
+    # Fallback: look for game-created backups under <StorageDirectory>\Backup\<WorldName-...> folders
+    $storageRoot = Join-Path $ScriptDir $Config.StorageDirectory
+    $storageBackupDir = Join-Path $storageRoot 'Backup'
+    if (Test-Path $storageBackupDir) {
+        $dirs = Get-ChildItem $storageBackupDir -Directory -ErrorAction SilentlyContinue
+
+        # If we loaded a base WorldSaveName (e.g. 'Game'), filter folders that start with that base plus '-'
+        if ($Config.WorldSaveName) {
+            $pattern = "$($Config.WorldSaveName)-*"
+            $dirs = $dirs | Where-Object { $_.Name -like $pattern }
+        }
+
+        if ($dirs -and $dirs.Count -gt 0) {
+            $latestFolder = $null
+            $latestTime = [DateTime]::MinValue
+
+            foreach ($d in $dirs) {
+                $dt = $null
+                # Expect folder names like <WorldBase>-YYYY-MM-DD-HH.MM.SS (e.g. Game-2026-06-27-10.59.01)
+                $m = [regex]::Match($d.Name, '^(?:.+)-(?<ts>\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2})$')
+                if ($m.Success) {
+                    $ts = $m.Groups['ts'].Value
+                    $parts = $ts -split '-'
+                    if ($parts.Length -eq 4) {
+                        $date = "$($parts[0])-$($parts[1])-$($parts[2])"
+                        $time = ($parts[3] -replace '\.', ':')
+                        $dtStr = "$date $time"
+                        try { $dt = [DateTime]::ParseExact($dtStr, 'yyyy-MM-dd HH:mm:ss', $null) } catch { $dt = $null }
+                    }
+                }
+
+                if (-not $dt) { $dt = $d.LastWriteTime }
+
+                if ($dt -gt $latestTime) { $latestTime = $dt; $latestFolder = $d }
+            }
+
+            if ($latestFolder) {
+                $dbFile = Get-ChildItem $latestFolder.FullName -Filter '*.db' -File -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($dbFile) {
+                    Copy-Item $dbFile.FullName $Config.DbPath -Force
+                    Write-Log "Restored DB from game backup folder $($latestFolder.Name) -> $($dbFile.Name)"
+                    return
+                }
+            }
+        }
+    }
+
+    Write-Log 'No backup available' 'WARN'
 }
 
 function Stop-Eco {
+    param([switch]$Manual)
     if ($global:State -in @([EcoState]::STOPPED, [EcoState]::STOPPING)) { return }
+    if ($Manual) { $global:ManualStopped = $true }
     Set-State [EcoState]::STOPPING
     try {
         if ($global:EcoProcess -and -not $global:EcoProcess.HasExited) {
@@ -317,8 +452,11 @@ function Stop-Eco {
             try {
                 if ($Config.RconHost) {
                     try { Invoke-RconSource -command 'manage save' | Out-Null } catch { Write-Log 'Source RCON save failed, falling back to auto Invoke-Rcon' 'DEBUG'; Invoke-Rcon -command 'manage save' | Out-Null }
-                    $t = (Get-Date).AddMinutes(1).ToString('HH:mm')
-                    $cmd = "manage maintenance $t, Watchdog shutdown, Shutdown"
+                    $t = (Get-Date).AddMinutes(1)
+                    $cmd = "manage maintenance $($t.ToString('HH:mm')), Watchdog shutdown, Shutdown"
+                    # Record scheduled maintenance so UI can show it
+                    $global:ScheduledMaintenance = $t
+                    $global:ScheduledMaintenanceReason = 'Watchdog shutdown'
                     try { Invoke-RconSource -command $cmd | Out-Null } catch { Write-Log 'Source RCON maintenance failed, falling back to auto Invoke-Rcon' 'DEBUG'; Invoke-Rcon -command $cmd | Out-Null }
                     # In unit tests, also call the generic Invoke-Rcon mock so tests that assert
                     # that Invoke-Rcon was called continue to work.
@@ -337,6 +475,9 @@ function Stop-Eco {
                 if (-not $p -or ($p.StartTime -ne $origStart)) {
                     Write-Log 'Eco original process exited cleanly'
                     Remove-Item $Config.ShutdownSignal -ErrorAction SilentlyContinue
+                    # Clear scheduled maintenance once the shutdown has occurred
+                    $global:ScheduledMaintenance = $null
+                    $global:ScheduledMaintenanceReason = $null
                     $global:EcoProcess = $null
                     Set-State [EcoState]::STOPPED
                     return
@@ -344,7 +485,7 @@ function Stop-Eco {
                 Start-Sleep -Seconds 1
             }
 
-            Write-Log 'Grace timeout reached — killing original process'
+            Write-Log 'Grace timeout reached " killing original process'
             try { Stop-Process -Id $global:EcoProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
         }
     } finally {
@@ -354,10 +495,10 @@ function Stop-Eco {
     }
 }
 
-function Repair-Eco {
+function Repair-Server {
     Set-State [EcoState]::RECOVERING
     Write-Log 'Recovery initiated'
-    $backup = Backup-DB
+    $backup = Backup-Database
     Stop-Eco
     Start-Sleep -Seconds 3
     $wait = 0
@@ -370,9 +511,9 @@ function Repair-Eco {
     Start-Sleep -Seconds 5
 
     if ($global:State -ne [EcoState]::RUNNING) {
-        Write-Log 'Initial restart failed, attempting restore from latest backup' 'WARN'
+                             Write-Log 'Initial restart failed, attempting restore from latest backup' 'WARN'
         # restore latest backup and try again
-        Restore-LatestBackup
+                            Restore-Database
         Start-Sleep -Seconds 1
         Start-Eco
         Start-Sleep -Seconds 5
@@ -399,17 +540,88 @@ function Invoke-Health {
 }
 
 # ------------------------------
+# Scheduling helpers
+# ------------------------------
+function Set-ScheduledStart {
+    param([Parameter(Mandatory=$true)][datetime]$Time)
+    $global:ScheduledStart = $Time
+    Write-Log "Scheduled start at $($Time)"
+}
+
+function Remove-ScheduledStart {
+    $global:ScheduledStart = $null
+    Write-Log 'Cancelled scheduled start'
+}
+
+function Set-ScheduledMaintenance {
+    param(
+        [Parameter(Mandatory=$true)][datetime]$Time,
+        [string]$Reason = 'Scheduled maintenance'
+    )
+    $global:ScheduledMaintenance = $Time
+    $global:ScheduledMaintenanceReason = $Reason
+    Write-Log "Scheduled maintenance at $($Time) - $Reason"
+}
+
+function Remove-ScheduledMaintenance {
+    $global:ScheduledMaintenance = $null
+    $global:ScheduledMaintenanceReason = $null
+    Write-Log 'Cancelled scheduled maintenance'
+}
+
+# ------------------------------
 # UI Helpers
 # ------------------------------
+function Get-KeyForAction {
+    param([Parameter(Mandatory=$true)][string]$Action)
+    foreach ($k in $Config.KeyBindings.Keys) {
+        if ($Config.KeyBindings[$k].Action -eq $Action) { return $k }
+    }
+    return $null
+}
+
 function Show-UI {
-    Clear-Host
-    Write-Host '=== ECO WATCHDOG (production) ===' -ForegroundColor Cyan
-    Write-Host "STATE   : $($global:State)"
-    if ($global:EcoProcess) { Write-Host "PROCESS : RUNNING (PID $($global:EcoProcess.Id))" } else { Write-Host 'PROCESS : STOPPED' }
-    Write-Host "HEALTH  : $global:LastHealth"
-    Write-Host "TIME    : $(Get-Date)"
-    Write-Host ''
-    Write-Host 'Controls: H=Health R=Repair S=Stop A=Start L=Logs Q=Quit' -ForegroundColor Yellow
+    param([switch]$Force)
+
+    if (-not $script:UIInitialized -or $Force) {
+        Clear-Host
+        $script:UIInitialized = $true
+    }
+
+    # Prepare lines to write to a fixed region at the top of the console
+    $width = 80
+    try { $width = [Console]::WindowWidth - 1 } catch {}
+
+    $lines = @()
+    $lines += '=== ECO WATCHDOG (production) ==='.PadRight($width)
+    $lines += ("STATE   : $($global:State)").PadRight($width)
+    if ($global:EcoProcess) { $lines += ("PROCESS : RUNNING (PID $($global:EcoProcess.Id))").PadRight($width) } else { $lines += ('PROCESS : STOPPED').PadRight($width) }
+    $lines += ("HEALTH  : $global:LastHealth").PadRight($width)
+    if ($global:ScheduledStart) { $lines += ("SCHEDULED START : $($global:ScheduledStart)").PadRight($width) }
+    if ($global:ScheduledMaintenance) { $lines += ("SCHEDULED MAINT.: $($global:ScheduledMaintenance) - $($global:ScheduledMaintenanceReason)").PadRight($width) }
+    $lines += ("TIME    : $(Get-Date)").PadRight($width)
+    $lines += ''.PadRight($width)
+
+    # Build controls display from configured key bindings
+    $controls = @()
+    foreach ($k in $Config.KeyDisplayOrder) {
+        if ($Config.KeyBindings.Contains($k)) {
+            $binding = $Config.KeyBindings[$k]
+            $label = $binding.Label
+            $controls += "$k=$label"
+        }
+    }
+    $lines += ("Controls: " + ($controls -join ' ')).PadRight($width)
+
+    # Overwrite the top portion of the console to avoid a full clear
+    try {
+        [Console]::SetCursorPosition(0,0)
+    } catch {}
+    foreach ($i in 0..($lines.Count - 1)) {
+        $text = $lines[$i]
+        # Colorize header and controls like before
+        if ($i -eq 0) { Write-Host $text -ForegroundColor Cyan } elseif ($i -eq ($lines.Count - 1)) { Write-Host $text -ForegroundColor Yellow } else { Write-Host $text }
+    }
 }
 
 # ------------------------------
@@ -419,19 +631,85 @@ function Start-Watchdog {
     Start-Eco
 
     $script:lastHealthCheck = Get-Date
+    # Display mode controls what is shown to the operator: 'UI' or 'LOGS'
+    $script:DisplayMode = 'UI'
 
     while ($true) {
-        Show-UI
+        if ($script:DisplayMode -eq 'UI') {
+            # Update UI only when important values change or once per second
+            $now = Get-Date
+            if (-not $script:LastUIState) { $needUI = $true; $script:LastUIState = @{} } else { $needUI = $false }
+            if (-not $needUI) {
+                $curPid = if ($global:EcoProcess) { $global:EcoProcess.Id } else { $null }
+                if ($script:LastUIState.State -ne $global:State) { $needUI = $true }
+                if ($script:LastUIState.Pid -ne $curPid) { $needUI = $true }
+                if ($script:LastUIState.LastHealth -ne $global:LastHealth) { $needUI = $true }
+                if ($script:LastUIState.ScheduledStart -ne $global:ScheduledStart) { $needUI = $true }
+                if ($script:LastUIState.ScheduledMaintenance -ne $global:ScheduledMaintenance) { $needUI = $true }
+                if ($script:LastUIState.Second -ne $now.Second) { $needUI = $true }
+            }
+            if ($needUI) {
+                Show-UI
+                $script:LastUIState.State = $global:State
+                $script:LastUIState.Pid = if ($global:EcoProcess) { $global:EcoProcess.Id } else { $null }
+                $script:LastUIState.LastHealth = $global:LastHealth
+                $script:LastUIState.ScheduledStart = $global:ScheduledStart
+                $script:LastUIState.ScheduledMaintenance = $global:ScheduledMaintenance
+                $script:LastUIState.Second = (Get-Date).Second
+            }
+        } else {
+            # Stream logs incrementally to avoid clearing the screen each refresh.
+            if (-not $script:LogInitialized) {
+                Clear-Host
+                Write-Host '=== ECO WATCHDOG: LOGS ===' -ForegroundColor Cyan
+                $backKey = Get-KeyForAction -Action 'Back'
+                $quitKey = Get-KeyForAction -Action 'Quit'
+                $parts = @()
+                if ($backKey) { $parts += "$backKey to go back to UI" } else { $parts += "Back to go back to UI" }
+                if ($quitKey) { $parts += "$quitKey to quit" } else { $parts += "Quit to quit" }
+                Write-Host ("(Press {0})" -f ($parts -join '; ')) -ForegroundColor Yellow
+                if (Test-Path $Config.LogFile) {
+                    $all = Get-Content -Path $Config.LogFile -ErrorAction SilentlyContinue
+                    $start = [Math]::Max(0, $all.Count - 200)
+                    if ($all.Count -gt 0) { $all[$start..($all.Count - 1)] | ForEach-Object { Write-Host $_ } }
+                    $script:LogCount = $all.Count
+                } else {
+                    Write-Host '(No log file found)'
+                    $script:LogCount = 0
+                }
+                $script:LogInitialized = $true
+            } else {
+                if (Test-Path $Config.LogFile) {
+                    $current = Get-Content -Path $Config.LogFile -ErrorAction SilentlyContinue
+                    if ($current.Count -gt $script:LogCount) {
+                        $current[$script:LogCount..($current.Count - 1)] | ForEach-Object { Write-Host $_ }
+                        $script:LogCount = $current.Count
+                    }
+                }
+            }
+        }
 
         if ([Console]::KeyAvailable) {
-            $k = [Console]::ReadKey($true).Key
-            switch ($k) {
-                'H' { Invoke-Health }
-                'R' { Repair-Eco }
-                'S' { Stop-Eco }
-                'A' { Start-Eco }
-                'L' { if (Test-Path $Config.LogFile) { Get-Content -Path $Config.LogFile -Tail 200 } }
-                'Q' { Stop-Eco; break }
+            $pressedKey = [Console]::ReadKey($true).Key.ToString()
+            # Normalize single-letter keys to their first char when appropriate
+            if ($pressedKey.Length -gt 1 -and $pressedKey.StartsWith('D') -and $pressedKey.Length -eq 2) {
+                $pressedKey = $pressedKey.Substring(1)
+            }
+            # Use uppercase short form when possible
+            $pressed = $pressedKey.Substring(0,1).ToUpper()
+            if ($Config.KeyBindings.Contains($pressed)) {
+                $binding = $Config.KeyBindings[$pressed]
+                $action = $binding.Action
+                switch ($action) {
+                    'Health' { Invoke-Health }
+                    'Repair' { Repair-Eco }
+                    'Stop'   { Stop-Eco -Manual }
+                    'Start'  { Start-Eco }
+                    'Logs'   { $script:DisplayMode = 'LOGS' }
+                    'Back'   { $script:DisplayMode = 'UI'; $script:LogInitialized = $false }
+                    'Quit'   { Stop-Eco -Manual; $global:ShouldQuit = $true; break }
+                    default  { Write-Log "Unknown action mapped: $action" 'DEBUG' }
+                }
             }
         }
 
@@ -444,11 +722,51 @@ function Start-Watchdog {
         # auto-detect process crash and repair
         if ($global:State -eq [EcoState]::RUNNING) {
             if ($global:EcoProcess -and $global:EcoProcess.HasExited) {
-                Write-Log 'Detected process exit — initiating recovery' 'WARN'
+                Write-Log 'Detected process exit " initiating recovery' 'WARN'
                 Repair-Eco
             }
         }
 
+        # Scheduled start: if a start time is set and reached, attempt to start
+        if ($global:ScheduledStart -and -not $global:ManualStopped -and -not (Get-EcoProcess)) {
+            if ((Get-Date) -ge $global:ScheduledStart) {
+                Write-Log "Scheduled start time reached: $($global:ScheduledStart) - starting server" 'INFO'
+                $tmp = $global:ScheduledStart
+                $global:ScheduledStart = $null
+                Start-Eco
+            }
+        }
+
+        # Scheduled maintenance: if set and the time has come, send the RCON command
+        if ($global:ScheduledMaintenance) {
+            if ((Get-Date) -ge $global:ScheduledMaintenance) {
+                $timeStr = $global:ScheduledMaintenance.ToString('HH:mm')
+                $cmd = "manage maintenance $timeStr, $($global:ScheduledMaintenanceReason), Shutdown"
+                Write-Log "Executing scheduled maintenance command: $cmd" 'INFO'
+                try {
+                    try { Invoke-RconSource -command $cmd | Out-Null } catch { Invoke-Rcon -command $cmd | Out-Null }
+                    Write-Log 'Scheduled maintenance command sent'
+                } catch { Write-Log "Failed to send scheduled maintenance: $_" 'WARN' }
+                # Clear scheduled maintenance after attempting
+                $global:ScheduledMaintenance = $null
+                $global:ScheduledMaintenanceReason = $null
+            }
+        }
+
+        # If both the state machine and health probe indicate failure, and the
+        # server was not explicitly stopped by an operator/script, attempt an
+        # automatic start after a short delay. This avoids fighting a manual stop.
+        if (($global:State -eq [EcoState]::FAILED) -and ($global:LastHealth -eq 'FAIL') -and -not $global:ManualStopped) {
+            Write-Log 'Combined state+health failure detected " scheduling auto-start in 30s' 'WARN'
+            Start-Sleep -Seconds 30
+            # Re-evaluate before attempting
+            if (($global:State -eq [EcoState]::FAILED) -and ($global:LastHealth -eq 'FAIL') -and -not $global:ManualStopped -and -not (Get-EcoProcess)) {
+                Write-Log 'Performing automatic Start-Eco due to persistent failure' 'INFO'
+                Start-Eco
+            }
+        }
+
+        if ($global:ShouldQuit) { break }
         Start-Sleep -Milliseconds 300
     }
 }
@@ -457,3 +775,5 @@ function Start-Watchdog {
 if ($env:UNIT_TEST -ne '1') {
     Start-Watchdog
 }
+
+

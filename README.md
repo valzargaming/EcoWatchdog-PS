@@ -33,9 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_tests.ps1
 
 **Configuration & Secrets**
 - Config files live in the `Configs/` directory. By default the code reads server config from these files.
-- Do NOT commit secrets (RCON passwords) into the repository. Recommended options:
-  - Remove any `RconPassword` from `Configs/Network.eco` and place it in a local, ignored file such as `Configs/Network.eco.local`.
-  - Or configure the secret on the host via a platform secret store or environment variable.
+- Do NOT commit secrets (RCON passwords) into the repository.
 
 **Important scripts**
 - `EcoWatchdog.ps1` — main watchdog implementation (state machine, RCON clients, backups, rotation)

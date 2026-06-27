@@ -5,6 +5,7 @@
 
 # Keep git metadata
 !.gitignore
+!.github
 
 # Allow project scripts at repository root
 !/*.ps1
@@ -13,12 +14,15 @@
 # Keep README and license in repo
 !/README.md
 !/LICENSE
+!/AGENTS.md
 
-# Allow the scripts/ and tests/ folders and their contents
+# Allow project folders and their contents
 !/scripts/
 !/scripts/**
 !/tests/
 !/tests/**
+!/tools/
+!/tools/**
 
 # Local overrides and templates should be kept out of VCS (templates can stay)
 *.local.ps1
