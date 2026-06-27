@@ -1,0 +1,28 @@
+# Default: ignore everything in the server directory (this is the actual
+# server installation). Only explicitly allowed files and folders below
+# are kept under version control for this project.
+/*
+
+# Keep git metadata
+!.gitignore
+
+# Allow project scripts at repository root
+!/*.ps1
+!/*.bat
+
+# Keep README and license in repo
+!/README.md
+!/LICENSE
+
+# Allow the scripts/ and tests/ folders and their contents
+!/scripts/
+!/scripts/**
+!/tests/
+!/tests/**
+
+# Local overrides and templates should be kept out of VCS (templates can stay)
+*.local.ps1
+
+# Runtime files and backups should not be committed
+backups/
+Storage/
