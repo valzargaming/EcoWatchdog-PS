@@ -7,16 +7,39 @@ $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $Here '..\EcoWatchdog.ps1')
 
 Describe 'Repair flow with restore on failure' {
-    It 'attempts Restore-LatestBackup when Start-Eco fails initially' {
-        # Prepare mocks: Start-Eco fails, Restore-LatestBackup recorded
-        Mock -CommandName Start-Eco { Set-State 'FAILED' }
-        Mock -CommandName Restore-Database { } -Verifiable
+    It 'restores a recent larger backup when initial start fails' {
+        $tmp = Join-Path $env:TEMP ('eco_repair_' + (Get-Random))
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        try {
+            $liveDb = Join-Path $tmp 'Storage.db'
+            $backupDir = Join-Path $tmp 'backups'
+            New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 
-        # Run Repair-Server (approved verb wrapper)
-        Repair-Server
+            # point config to temp
+            $oldDb = $Config.DbPath; $oldBackup = $Config.BackupDir
+            $Config.DbPath = $liveDb; $Config.BackupDir = $backupDir
 
-        # Assert restore called
-        Assert-MockCalled -CommandName Restore-Database -Times 1
+            # create live DB (small)
+            Set-Content -Path $liveDb -Value 'live-small'
+            # create backup DB (larger) and set timestamps within 60s
+            $bfile = Join-Path $backupDir 'Storage_backup.db'
+            Set-Content -Path $bfile -Value ('backup-large' * 100)
+            $now = Get-Date
+            (Get-Item $bfile).LastWriteTime = $now.AddSeconds(-30)
+            (Get-Item $liveDb).LastWriteTime = $now
+
+            # Mock Start-Eco to simulate initial failure
+            Mock -CommandName Start-Eco { Set-State 'FAILED' }
+
+            # Run repair which should copy the recent larger backup over live DB
+            Repair-Server
+
+            $content = Get-Content -Path $liveDb -Raw
+            if ($content -notmatch 'backup-large') { throw 'Repair-Server did not restore the recent larger backup' }
+
+            # restore config
+            $Config.DbPath = $oldDb; $Config.BackupDir = $oldBackup
+        } finally { Remove-Item -Recurse -Force $tmp }
     }
 }
 
@@ -32,14 +55,17 @@ Describe 'Backup and Restore real files in temp dir' {
         $oldDb = $Config.DbPath; $oldBackup = $Config.BackupDir
         $Config.DbPath = $origDb; $Config.BackupDir = $backupDir
 
-        Set-Content -Path $origDb -Value 'good-db'
-        $b = Backup-Database
-        Test-Path $b | Should Be $true
+            Set-Content -Path $origDb -Value 'good-db-content-longer-than-corrupt'
+        # Simulate server-managed backup by copying the DB into the backups folder
+        $stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+        $simBackup = Join-Path $backupDir "Storage_$stamp.db"
+        Copy-Item -Path $origDb -Destination $simBackup -Force
+        if (-not (Test-Path $simBackup)) { throw "Simulated backup was not created: $simBackup" }
 
-        # corrupt original
-        Set-Content -Path $origDb -Value 'corrupt'
+        # corrupt original and ensure restore pulls from server backup
+            Set-Content -Path $origDb -Value 'x'
         Restore-Database
-        (Get-Content $origDb -Raw) | Should Match 'good-db'
+        if (-not ((Get-Content $origDb -Raw) -match 'good-db')) { throw 'Restore-Database did not restore expected DB contents' }
 
         # cleanup
         $Config.DbPath = $oldDb; $Config.BackupDir = $oldBackup

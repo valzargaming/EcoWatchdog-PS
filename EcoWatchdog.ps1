@@ -86,6 +86,11 @@ $Config = [ordered]@{
     WorldSaveName            = $null
     # Storage directory name (relative to script dir), read from Storage.eco StorageDirectory
     StorageDirectory         = 'Storage'
+    # DB corruption detection: prefer percentage (0.9 = 90%). Set KB threshold (>0) to use absolute size difference instead.
+    DbCorruptionThresholdKB  = 0
+    DbCorruptionThresholdPct = 0.9
+    # Window (seconds) to consider a backup "recent" relative to the live DB
+    DbRecentBackupWindowSeconds = 60
 }
 
 # UI key bindings (configurable): map console key name -> action token
@@ -371,20 +376,64 @@ function Start-Eco {
 }
 
 function Backup-Database {
-    if (-not (Test-Path $Config.DbPath)) { Write-Log 'No DB to backup' 'WARN'; return $null }
-    $stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
-    $dest = Join-Path $Config.BackupDir "Storage_$stamp.db"
-    Copy-Item $Config.DbPath $dest -Force
-    Write-Log "DB backup created: $dest"
-    return $dest
+    <#
+    NOTE: Backup management is the responsibility of the game server.
+    This helper no longer creates backups. It performs a lightweight
+    sanity check on the DB and returns $null (no backup created).
+    Callers should not rely on a returned backup path.
+    #>
+    if (-not (Test-Path $Config.DbPath)) {
+        Write-Log 'No DB present to check' 'WARN'
+        return $null
+    }
+
+    try {
+        $info = Get-Item $Config.DbPath -ErrorAction Stop
+        if ($info.Length -lt 1024) {
+            Write-Log 'DB file is unexpectedly small; may be corrupted' 'WARN'
+            return $null
+        }
+        # Additional integrity checks could be added here if sqlite3 is available.
+        Write-Log 'DB sanity check passed' 'DEBUG'
+        return $null
+    } catch {
+        Write-Log "DB sanity check failed: $_" 'WARN'
+        return $null
+    }
 }
 
 function Restore-Database {
+    # Helper: determine if current DB appears corrupted relative to a backup
+    function Test-DatabaseIntegrity($currentPath, $backupInfo) {
+        if (-not (Test-Path $currentPath)) { return $true }
+        try {
+            $cur = Get-Item $currentPath -ErrorAction Stop
+            # If a KB threshold is configured and >0, use absolute size delta
+            if ($Config.DbCorruptionThresholdKB -gt 0) {
+                $kbDiff = ($backupInfo.Length - $cur.Length) / 1KB
+                if ($kbDiff -ge $Config.DbCorruptionThresholdKB -and ($cur.LastWriteTime -gt $backupInfo.LastWriteTime)) { return $true }
+                return $false
+            }
+
+            # Otherwise use percentage threshold
+            $pct = $Config.DbCorruptionThresholdPct
+            if (-not $pct) { $pct = 0.9 }
+            $sizeRatio = 0.0
+            if ($backupInfo.Length -gt 0) { $sizeRatio = ($cur.Length / [double]$backupInfo.Length) }
+            if (($sizeRatio -le $pct) -and ($cur.LastWriteTime -gt $backupInfo.LastWriteTime)) { return $true }
+            return $false
+        } catch { return $true }
+    }
+
     # First, look in the watchdog backup dir for backups created by this script
     $latest = Get-ChildItem $Config.BackupDir -Filter '*.db' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($latest) {
-        Copy-Item $latest.FullName $Config.DbPath -Force
-        Write-Log "Restored DB from $($latest.Name) (watchdog backup)"
+        if ($latest) {
+        if (Test-DatabaseIntegrity -currentPath $Config.DbPath -backupInfo $latest) {
+            Copy-Item $latest.FullName $Config.DbPath -Force
+            Write-Log "Restored DB from $($latest.Name) (watchdog backup)"
+        } else {
+            Write-Log "Existing DB is newer or not substantially smaller than backup; skipping restore from watchdog backup" 'DEBUG'
+        }
         return
     }
 
@@ -425,18 +474,68 @@ function Restore-Database {
             }
 
             if ($latestFolder) {
-                $dbFile = Get-ChildItem $latestFolder.FullName -Filter '*.db' -File -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                if ($dbFile) {
-                    Copy-Item $dbFile.FullName $Config.DbPath -Force
-                    Write-Log "Restored DB from game backup folder $($latestFolder.Name) -> $($dbFile.Name)"
-                    return
+                    $dbFile = Get-ChildItem $latestFolder.FullName -Filter '*.db' -File -ErrorAction SilentlyContinue |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                    if ($dbFile) {
+                        if (Test-DatabaseIntegrity -currentPath $Config.DbPath -backupInfo $dbFile) {
+                            Copy-Item $dbFile.FullName $Config.DbPath -Force
+                            Write-Log "Restored DB from game backup folder $($latestFolder.Name) -> $($dbFile.Name)"
+                            # Also restore any .eco world files present in the backup folder
+                            try {
+                                $storageRoot = Join-Path $ScriptDir $Config.StorageDirectory
+                                $ecoFiles = Get-ChildItem $latestFolder.FullName -Filter '*.eco' -File -ErrorAction SilentlyContinue
+                                foreach ($ef in $ecoFiles) {
+                                    Copy-Item $ef.FullName (Join-Path $storageRoot $ef.Name) -Force
+                                    Write-Log "Restored world file $($ef.Name) from $($latestFolder.Name)"
+                                }
+                            } catch { Write-Log "Failed restoring .eco files: $_" 'WARN' }
+                        } else {
+                            Write-Log "Existing DB appears healthy relative to game backup; skipping restore" 'DEBUG'
+                        }
+                        return
+                    }
                 }
-            }
         }
     }
 
     Write-Log 'No backup available' 'WARN'
+}
+
+# Return the FileInfo for the most recent backup DB (watchdog or game backups)
+function Get-LatestBackupFile {
+    $latest = Get-ChildItem $Config.BackupDir -Filter '*.db' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($latest) { return $latest }
+
+    $storageRoot = Join-Path $ScriptDir $Config.StorageDirectory
+    $storageBackupDir = Join-Path $storageRoot 'Backup'
+    if (Test-Path $storageBackupDir) {
+        $dirs = Get-ChildItem $storageBackupDir -Directory -ErrorAction SilentlyContinue
+        if ($dirs -and $dirs.Count -gt 0) {
+            $latestFolder = $null
+            $latestTime = [DateTime]::MinValue
+            foreach ($d in $dirs) {
+                $dt = $null
+                $m = [regex]::Match($d.Name, '^(?:.+)-(?<ts>\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2})$')
+                if ($m.Success) {
+                    $ts = $m.Groups['ts'].Value
+                    $parts = $ts -split '-'
+                    if ($parts.Length -eq 4) {
+                        $date = "$($parts[0])-$($parts[1])-$($parts[2])"
+                        $time = ($parts[3] -replace '\.', ':')
+                        $dtStr = "$date $time"
+                        try { $dt = [DateTime]::ParseExact($dtStr, 'yyyy-MM-dd HH:mm:ss', $null) } catch { $dt = $null }
+                    }
+                }
+                if (-not $dt) { $dt = $d.LastWriteTime }
+                if ($dt -gt $latestTime) { $latestTime = $dt; $latestFolder = $d }
+            }
+            if ($latestFolder) {
+                $dbFile = Get-ChildItem $latestFolder.FullName -Filter '*.db' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($dbFile) { return $dbFile }
+            }
+        }
+    }
+    return $null
 }
 
 function Stop-Eco {
@@ -511,9 +610,31 @@ function Repair-Server {
     Start-Sleep -Seconds 5
 
     if ($global:State -ne [EcoState]::RUNNING) {
-                             Write-Log 'Initial restart failed, attempting restore from latest backup' 'WARN'
-        # restore latest backup and try again
-                            Restore-Database
+        Write-Log 'Initial restart failed, checking for recent larger backup to restore' 'WARN'
+        # If a recent backup exists and is larger than the live DB and was created within 1 minute of the live DB, restore it
+        $latest = Get-LatestBackupFile
+        if ($latest) {
+            try {
+                $liveInfo = if (Test-Path $Config.DbPath) { Get-Item $Config.DbPath -ErrorAction Stop } else { $null }
+                $timeDiff = [TimeSpan]::MaxValue
+                if ($liveInfo) { $timeDiff = [System.Math]::Abs((($latest.LastWriteTime) - $liveInfo.LastWriteTime).TotalSeconds) }
+                # Criteria: latest backup larger than live, and created within configured recent window of live DB
+                $window = if ($Config.DbRecentBackupWindowSeconds) { $Config.DbRecentBackupWindowSeconds } else { 60 }
+                if ($liveInfo -and ($latest.Length -gt $liveInfo.Length) -and ($timeDiff -le $window)) {
+                    Write-Log "Recent larger backup found ($($latest.Name)); restoring before retry" 'WARN'
+                    Copy-Item $latest.FullName $Config.DbPath -Force
+                } else {
+                    Write-Log 'No suitable recent larger backup found; attempting Restore-Database fallback' 'DEBUG'
+                    Restore-Database
+                }
+            } catch {
+                Write-Log "Error evaluating latest backup: $_" 'WARN'
+                Restore-Database
+            }
+        } else {
+            Write-Log 'No backups found; attempting Restore-Database fallback' 'DEBUG'
+            Restore-Database
+        }
         Start-Sleep -Seconds 1
         Start-Eco
         Start-Sleep -Seconds 5
