@@ -1,5 +1,7 @@
 # Eco Server Watchdog
 
+[![Pester — Approved Verbs](https://github.com/valzargaming/EcoWatchdog-PS/actions/workflows/pester-approved-verbs.yml/badge.svg)](https://github.com/valzargaming/EcoWatchdog-PS/actions/workflows/pester-approved-verbs.yml)
+
 A PowerShell-based watchdog and helper toolkit for managing an Eco game server.
 
 This repository contains scripts and tests for monitoring, gracefully shutting down,
