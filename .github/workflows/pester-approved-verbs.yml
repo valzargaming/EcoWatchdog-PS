@@ -30,4 +30,13 @@ jobs:
         shell: pwsh
         run: |
           Import-Module Pester -ErrorAction Stop
-          Invoke-Pester -Script tests/ApprovedVerbs.Tests.ps1 -EnableExit
+          $invoke = Get-Command Invoke-Pester -ErrorAction Stop
+          $params = $invoke.Parameters.Keys
+          if ($params -contains 'Exit') {
+              Invoke-Pester -Path tests/ApprovedVerbs.Tests.ps1 -Exit
+          } elseif ($params -contains 'EnableExit') {
+              Invoke-Pester -Script tests/ApprovedVerbs.Tests.ps1 -EnableExit
+          } else {
+              # Fallback: call default parameter set (older Pester)
+              Invoke-Pester tests/ApprovedVerbs.Tests.ps1
+          }

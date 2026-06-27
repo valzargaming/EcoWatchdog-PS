@@ -80,9 +80,7 @@ Describe 'PSUseApprovedVerbs' {
         if ($issues.Count -gt 0) {
             $msg = "Found functions using non-approved verbs:`n"
             $issues | ForEach-Object { $msg += "  $($_.File) -> $($_.Function) (verb='$($_.Verb)') suggested='$($_.SuggestedVerb)'-`n" }
-            Write-Host $msg
+            throw $msg
         }
-
-        $issues.Count | Should Be 0
     }
 }
