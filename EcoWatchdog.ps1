@@ -108,6 +108,18 @@ $Config.KeyBindings = [ordered]@{
 $Config.KeyDisplayOrder = @($Config.KeyBindings.Keys)
 
 # Minimal logging stub so early initialization can call Write-Log
+function Set-LastFunction {
+    param([string]$Name)
+    try {
+        if ($Name) { $func = $Name } else {
+            $stack = Get-PSCallStack
+            if ($stack.Count -ge 2) { $func = $stack[1].FunctionName } else { $func = $MyInvocation.MyCommand.Name }
+        }
+    } catch { $func = $MyInvocation.MyCommand.Name }
+    $ts = (Get-Date).ToString('s')
+    $global:LastFunction = "$func at $ts"
+}
+
 function Write-Log { param([string]$message, [string]$level = 'INFO')
     try { Add-Content -Path $Config.LogFile -Value ("[$((Get-Date).ToString('s'))] [$level] $message") -ErrorAction SilentlyContinue } catch {}
 }
@@ -131,6 +143,7 @@ if (-not $Config.RconPassword) {
 
 # Load world/save name from Configs/Storage.eco so the watchdog knows current world
 function Import-StorageSaveName {
+    Set-LastFunction
     $storageCfg = Join-Path $ScriptDir 'Configs\Storage.eco'
     if (-not (Test-Path $storageCfg)) { return }
     try {
@@ -163,6 +176,10 @@ enum EcoState { STOPPED; STARTING; RUNNING; STOPPING; RECOVERING; FAILED }
 $global:State = [EcoState]::STOPPED
 $global:EcoProcess = $null
 $global:LastHealth = 'UNKNOWN'
+# Last operator-visible action (e.g. "Manual stop requested at ...")
+$global:LastAction = 'None'
+# Last automatic action taken by the watchdog (e.g. auto-restart, auto-repair)
+$global:LastAutoAction = 'None'
 # When true the watchdog will not auto-restart the server (explicit manual stop)
 $global:ManualStopped = $false
 # Scheduled events (DateTime or $null)
@@ -171,11 +188,28 @@ $global:ScheduledMaintenance = $null
 $global:ScheduledMaintenanceReason = $null
 $global:ShouldQuit = $false
 
+# Track last function called (function name + timestamp)
+$global:LastFunction = 'None'
+
+# Helper to set last function called. Use callstack to determine caller when no name provided.
+function Set-LastFunction {
+    param([string]$Name)
+    try {
+        if ($Name) { $func = $Name } else {
+            $stack = Get-PSCallStack
+            if ($stack.Count -ge 2) { $func = $stack[1].FunctionName } else { $func = $MyInvocation.MyCommand.Name }
+        }
+    } catch { $func = $MyInvocation.MyCommand.Name }
+    $ts = (Get-Date).ToString('s')
+    $global:LastFunction = "$func at $ts"
+}
+
 # ------------------------------
 # Logging with rotation
 # ------------------------------
 function Move-Log {
     param([string]$path, [int64]$maxBytes, [int]$maxBackups)
+    Set-LastFunction
     if (-not (Test-Path $path)) { return }
     $info = Get-Item $path
     if ($info.Length -lt $maxBytes) { return }
@@ -205,6 +239,7 @@ function Write-Log {
 # ------------------------------
 function New-TcpClient {
     param($rHost, $port, $timeoutMs = 3000)
+    Set-LastFunction
     $client = New-Object System.Net.Sockets.TcpClient
     $iar = $client.BeginConnect($rHost, $port, $null, $null)
     $success = $iar.AsyncWaitHandle.WaitOne($timeoutMs)
@@ -215,6 +250,7 @@ function New-TcpClient {
 
 function Invoke-RconPlain {
     param([string]$command)
+    Set-LastFunction
     $client = New-TcpClient -rHost $Config.RconHost -port $Config.RconPort -timeoutMs $Config.RconConnectTimeoutMs
     if (-not $client) { throw 'RCON (plain) connection failed' }
     try {
@@ -233,6 +269,7 @@ function Invoke-RconPlain {
 
 function Invoke-RconSource {
     param([string]$command)
+    Set-LastFunction
     # Implement Source RCON binary protocol (auth + exec)
     $client = New-TcpClient -rHost $Config.RconHost -port $Config.RconPort -timeoutMs $Config.RconConnectTimeoutMs
     if (-not $client) { throw 'RCON (source) connection failed' }
@@ -243,6 +280,7 @@ function Invoke-RconSource {
         $encoding = [System.Text.Encoding]::ASCII
 
         function Send-Packet([int]$id, [int]$type, [string]$payload) {
+            Set-LastFunction
             $payloadBytes = $encoding.GetBytes($payload)
             $packetSize = 4 + 4 + $payloadBytes.Length + 2
             $sizeBytes = [System.BitConverter]::GetBytes([int32]$packetSize)
@@ -260,6 +298,7 @@ function Invoke-RconSource {
         }
 
         function Read-Packet() {
+            Set-LastFunction
             $sizeBuf = New-Object Byte[] 4
             $read = 0
             while ($read -lt 4) {
@@ -314,6 +353,7 @@ function Invoke-RconSource {
 
 function Invoke-Rcon {
     param([string]$command)
+    Set-LastFunction
     if ($Config.RconProtocol -eq 'plain') { return Invoke-RconPlain -command $command }
     if ($Config.RconProtocol -eq 'source') { return Invoke-RconSource -command $command }
 
@@ -327,6 +367,7 @@ function Invoke-Rcon {
 # Process helpers
 # ------------------------------
 function Get-EcoProcess {
+    Set-LastFunction
     $exe = $Config.EcoExe
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -eq $exe) } |
@@ -334,6 +375,7 @@ function Get-EcoProcess {
 }
 
 function Set-State { param($new)
+    Set-LastFunction
     # Accept either EcoState enum value or a string name
     if ($new -is [string]) {
         try { $new = [Enum]::Parse([EcoState], $new) } catch { }
@@ -348,6 +390,7 @@ function Set-State { param($new)
 }
 
 function Start-Eco {
+    Set-LastFunction
     if ($global:State -in @([EcoState]::RUNNING, [EcoState]::STARTING)) { return }
     # Clear manual-stop when attempting an explicit start
     $global:ManualStopped = $false
@@ -376,6 +419,7 @@ function Start-Eco {
 }
 
 function Backup-Database {
+    Set-LastFunction
     <#
     NOTE: Backup management is the responsibility of the game server.
     This helper no longer creates backups. It performs a lightweight
@@ -403,8 +447,10 @@ function Backup-Database {
 }
 
 function Restore-Database {
+    Set-LastFunction
     # Helper: determine if current DB appears corrupted relative to a backup
     function Test-DatabaseIntegrity($currentPath, $backupInfo) {
+        Set-LastFunction
         if (-not (Test-Path $currentPath)) { return $true }
         try {
             $cur = Get-Item $currentPath -ErrorAction Stop
@@ -503,6 +549,7 @@ function Restore-Database {
 
 # Return the FileInfo for the most recent backup DB (watchdog or game backups)
 function Get-LatestBackupFile {
+    Set-LastFunction
     $latest = Get-ChildItem $Config.BackupDir -Filter '*.db' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($latest) { return $latest }
 
@@ -540,8 +587,9 @@ function Get-LatestBackupFile {
 
 function Stop-Eco {
     param([switch]$Manual)
+    Set-LastFunction
     if ($global:State -in @([EcoState]::STOPPED, [EcoState]::STOPPING)) { return }
-    if ($Manual) { $global:ManualStopped = $true }
+    if ($Manual) { $global:ManualStopped = $true; $global:LastAction = "Manual stop requested at $(Get-Date)" }
     Set-State [EcoState]::STOPPING
     try {
         if ($global:EcoProcess -and -not $global:EcoProcess.HasExited) {
@@ -595,6 +643,7 @@ function Stop-Eco {
 }
 
 function Repair-Server {
+    Set-LastFunction
     Set-State [EcoState]::RECOVERING
     Write-Log 'Recovery initiated'
     $backup = Backup-Database
@@ -652,10 +701,12 @@ function Repair-Server {
 # Health checks
 # ------------------------------
 function Test-Health {
+    Set-LastFunction
     try { Invoke-WebRequest -Uri $Config.HealthUrl -TimeoutSec $Config.HealthTimeoutSeconds -UseBasicParsing | Out-Null; return $true } catch { return $false }
 }
 
 function Invoke-Health {
+    Set-LastFunction
     if (Test-Health) { $global:LastHealth = 'OK' } else { $global:LastHealth = 'FAIL'; Set-State [EcoState]::FAILED }
     Write-Log "Health: $global:LastHealth"
 }
@@ -665,11 +716,13 @@ function Invoke-Health {
 # ------------------------------
 function Set-ScheduledStart {
     param([Parameter(Mandatory=$true)][datetime]$Time)
+    Set-LastFunction
     $global:ScheduledStart = $Time
     Write-Log "Scheduled start at $($Time)"
 }
 
 function Remove-ScheduledStart {
+    Set-LastFunction
     $global:ScheduledStart = $null
     Write-Log 'Cancelled scheduled start'
 }
@@ -679,12 +732,14 @@ function Set-ScheduledMaintenance {
         [Parameter(Mandatory=$true)][datetime]$Time,
         [string]$Reason = 'Scheduled maintenance'
     )
+    Set-LastFunction
     $global:ScheduledMaintenance = $Time
     $global:ScheduledMaintenanceReason = $Reason
     Write-Log "Scheduled maintenance at $($Time) - $Reason"
 }
 
 function Remove-ScheduledMaintenance {
+    Set-LastFunction
     $global:ScheduledMaintenance = $null
     $global:ScheduledMaintenanceReason = $null
     Write-Log 'Cancelled scheduled maintenance'
@@ -695,6 +750,7 @@ function Remove-ScheduledMaintenance {
 # ------------------------------
 function Get-KeyForAction {
     param([Parameter(Mandatory=$true)][string]$Action)
+    Set-LastFunction
     foreach ($k in $Config.KeyBindings.Keys) {
         if ($Config.KeyBindings[$k].Action -eq $Action) { return $k }
     }
@@ -717,7 +773,9 @@ function Show-UI {
     $lines += '=== ECO WATCHDOG (production) ==='.PadRight($width)
     $lines += ("STATE   : $($global:State)").PadRight($width)
     if ($global:EcoProcess) { $lines += ("PROCESS : RUNNING (PID $($global:EcoProcess.Id))").PadRight($width) } else { $lines += ('PROCESS : STOPPED').PadRight($width) }
-    $lines += ("HEALTH  : $global:LastHealth").PadRight($width)
+    $lines += ("HEALTH      : $global:LastHealth").PadRight($width)
+    $lines += ("LAST MANUAL : $global:LastAction").PadRight($width)
+    $lines += ("LAST AUTO   : $global:LastAutoAction").PadRight($width)
     if ($global:ScheduledStart) { $lines += ("SCHEDULED START : $($global:ScheduledStart)").PadRight($width) }
     if ($global:ScheduledMaintenance) { $lines += ("SCHEDULED MAINT.: $($global:ScheduledMaintenance) - $($global:ScheduledMaintenanceReason)").PadRight($width) }
     $lines += ("TIME    : $(Get-Date)").PadRight($width)
@@ -749,6 +807,7 @@ function Show-UI {
 # Main runtime entry (guarded for unit tests)
 # ------------------------------
 function Start-Watchdog {
+    Set-LastFunction
     Start-Eco
 
     $script:lastHealthCheck = Get-Date
@@ -765,6 +824,8 @@ function Start-Watchdog {
                 if ($script:LastUIState.State -ne $global:State) { $needUI = $true }
                 if ($script:LastUIState.Pid -ne $curPid) { $needUI = $true }
                 if ($script:LastUIState.LastHealth -ne $global:LastHealth) { $needUI = $true }
+                if ($script:LastUIState.LastAction -ne $global:LastAction) { $needUI = $true }
+                if ($script:LastUIState.LastAutoAction -ne $global:LastAutoAction) { $needUI = $true }
                 if ($script:LastUIState.ScheduledStart -ne $global:ScheduledStart) { $needUI = $true }
                 if ($script:LastUIState.ScheduledMaintenance -ne $global:ScheduledMaintenance) { $needUI = $true }
                 if ($script:LastUIState.Second -ne $now.Second) { $needUI = $true }
@@ -774,6 +835,8 @@ function Start-Watchdog {
                 $script:LastUIState.State = $global:State
                 $script:LastUIState.Pid = if ($global:EcoProcess) { $global:EcoProcess.Id } else { $null }
                 $script:LastUIState.LastHealth = $global:LastHealth
+                $script:LastUIState.LastAction = $global:LastAction
+                $script:LastUIState.LastAutoAction = $global:LastAutoAction
                 $script:LastUIState.ScheduledStart = $global:ScheduledStart
                 $script:LastUIState.ScheduledMaintenance = $global:ScheduledMaintenance
                 $script:LastUIState.Second = (Get-Date).Second
@@ -822,13 +885,13 @@ function Start-Watchdog {
                 $binding = $Config.KeyBindings[$pressed]
                 $action = $binding.Action
                 switch ($action) {
-                    'Health' { Invoke-Health }
-                    'Repair' { Repair-Eco }
-                    'Stop'   { Stop-Eco -Manual }
-                    'Start'  { Start-Eco }
+                    'Health' { $global:LastAction = "Manual health check at $(Get-Date)"; Invoke-Health }
+                    'Repair' { $global:LastAction = "Manual repair initiated at $(Get-Date)"; Repair-Eco }
+                    'Stop'   { $global:LastAction = "Manual stop requested at $(Get-Date)"; Stop-Eco -Manual }
+                    'Start'  { $global:LastAction = "Manual start requested at $(Get-Date)"; Start-Eco }
                     'Logs'   { $script:DisplayMode = 'LOGS' }
                     'Back'   { $script:DisplayMode = 'UI'; $script:LogInitialized = $false }
-                    'Quit'   { Stop-Eco -Manual; $global:ShouldQuit = $true; break }
+                    'Quit'   { $global:LastAction = "Quit requested at $(Get-Date)"; Stop-Eco -Manual; $global:ShouldQuit = $true; break }
                     default  { Write-Log "Unknown action mapped: $action" 'DEBUG' }
                 }
             }
@@ -844,6 +907,7 @@ function Start-Watchdog {
         if ($global:State -eq [EcoState]::RUNNING) {
             if ($global:EcoProcess -and $global:EcoProcess.HasExited) {
                 Write-Log 'Detected process exit " initiating recovery' 'WARN'
+                $global:LastAutoAction = "Auto repair initiated at $(Get-Date)"
                 Repair-Eco
             }
         }
@@ -852,6 +916,7 @@ function Start-Watchdog {
         if ($global:ScheduledStart -and -not $global:ManualStopped -and -not (Get-EcoProcess)) {
             if ((Get-Date) -ge $global:ScheduledStart) {
                 Write-Log "Scheduled start time reached: $($global:ScheduledStart) - starting server" 'INFO'
+                $global:LastAutoAction = "Scheduled start executed at $(Get-Date)"
                 $global:ScheduledStart = $null
                 Start-Eco
             }
@@ -863,6 +928,7 @@ function Start-Watchdog {
                 $timeStr = $global:ScheduledMaintenance.ToString('HH:mm')
                 $cmd = "manage maintenance $timeStr, $($global:ScheduledMaintenanceReason), Shutdown"
                 Write-Log "Executing scheduled maintenance command: $cmd" 'INFO'
+                $global:LastAutoAction = "Scheduled maintenance executed at $(Get-Date) - $cmd"
                 try {
                     try { Invoke-RconSource -command $cmd | Out-Null } catch { Invoke-Rcon -command $cmd | Out-Null }
                     Write-Log 'Scheduled maintenance command sent'
@@ -877,11 +943,12 @@ function Start-Watchdog {
         # server was not explicitly stopped by an operator/script, attempt an
         # automatic start after a short delay. This avoids fighting a manual stop.
         if (($global:State -eq [EcoState]::FAILED) -and ($global:LastHealth -eq 'FAIL') -and -not $global:ManualStopped) {
-            Write-Log 'Combined state+health failure detected " scheduling auto-start in 30s' 'WARN'
+                Write-Log 'Combined state+health failure detected " scheduling auto-start in 30s' 'WARN'
             Start-Sleep -Seconds 30
             # Re-evaluate before attempting
             if (($global:State -eq [EcoState]::FAILED) -and ($global:LastHealth -eq 'FAIL') -and -not $global:ManualStopped -and -not (Get-EcoProcess)) {
                 Write-Log 'Performing automatic Start-Eco due to persistent failure' 'INFO'
+                $global:LastAutoAction = "Auto start executed at $(Get-Date)"
                 Start-Eco
             }
         }
