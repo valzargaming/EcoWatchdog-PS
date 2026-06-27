@@ -852,7 +852,6 @@ function Start-Watchdog {
         if ($global:ScheduledStart -and -not $global:ManualStopped -and -not (Get-EcoProcess)) {
             if ((Get-Date) -ge $global:ScheduledStart) {
                 Write-Log "Scheduled start time reached: $($global:ScheduledStart) - starting server" 'INFO'
-                $tmp = $global:ScheduledStart
                 $global:ScheduledStart = $null
                 Start-Eco
             }
