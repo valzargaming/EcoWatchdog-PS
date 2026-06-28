@@ -76,11 +76,13 @@ $Config = [ordered]@{
 
     # RCON configuration
     RconHost                 = '127.0.0.1'
+    # RCON port: default 3002, but can be overridden by Configs/Network.eco RconServerPort
     RconPort                 = 3002
     # RCON password SHOULD NOT be stored in the repo. The script will attempt
     # to read it from `Configs/Network.eco` if available. Do not commit secrets.
     RconPassword             = $null
-    RconProtocol             = 'auto'  # 'auto'|'plain'|'source'
+    # RCON protocol: 'auto' (try source then plain), 'source' (Valve Source RCON), or 'plain' (simple TCP)
+    RconProtocol             = 'auto'  # 'auto'|'source'|'plain'
     RconConnectTimeoutMs     = 3000
     # World/save name loaded from Configs/Storage.eco (e.g. "Game-2026-06-27-10.59.01")
     WorldSaveName            = $null
@@ -97,6 +99,7 @@ $Config = [ordered]@{
 $Config.KeyBindings = [ordered]@{
     H = @{ Action = 'Health'; Label = 'Health' }
     R = @{ Action = 'Repair'; Label = 'Repair' }
+    C = @{ Action = 'Rcon';   Label = 'Rcon' }
     S = @{ Action = 'Stop';   Label = 'Stop' }
     A = @{ Action = 'Start';  Label = 'Start' }
     L = @{ Action = 'Logs';   Label = 'Logs' }
@@ -282,15 +285,30 @@ function Invoke-RconPlain {
     $client = New-TcpClient -rHost $Config.RconHost -port $Config.RconPort -timeoutMs $Config.RconConnectTimeoutMs
     if (-not $client) { throw 'RCON (plain) connection failed' }
     try {
-        $stream = $client.GetStream()
-        $writer = New-Object System.IO.StreamWriter($stream)
+        $ns = $client.GetStream()
+        $ns.ReadTimeout = $Config.RconConnectTimeoutMs
+        $writer = New-Object System.IO.StreamWriter($ns)
         $writer.AutoFlush = $true
         if ($Config.RconPassword) { $writer.WriteLine($Config.RconPassword) }
         $writer.WriteLine($command)
-        Start-Sleep -Milliseconds 100
-        $reader = New-Object System.IO.StreamReader($stream)
-        $out = ""
-        while ($stream.DataAvailable) { $out += $reader.ReadLine() + "`n" }
+
+        # Read response into memory until read timeout occurs
+        $ms = New-Object System.IO.MemoryStream
+        $buf = New-Object Byte[] 4096
+        try {
+            while ($true) {
+                $read = $ns.Read($buf, 0, $buf.Length)
+                if ($read -le 0) { break }
+                $ms.Write($buf, 0, $read)
+                # small pause to allow additional data to arrive
+                Start-Sleep -Milliseconds 20
+            }
+        } catch [System.IO.IOException] {
+            # Read timeout reached - proceed with whatever we have
+        }
+        $bytes = $ms.ToArray()
+        $out = ''
+        if ($bytes.Length -gt 0) { $out = [System.Text.Encoding]::UTF8.GetString($bytes) }
         return $out.Trim()
     } finally { $client.Close() }
 }
@@ -382,12 +400,20 @@ function Invoke-RconSource {
 function Invoke-Rcon {
     param([string]$command)
     Set-LastFunction
-    if ($Config.RconProtocol -eq 'plain') { return Invoke-RconPlain -command $command }
     if ($Config.RconProtocol -eq 'source') { return Invoke-RconSource -command $command }
+    if ($Config.RconProtocol -eq 'plain') { return Invoke-RconPlain -command $command }
 
-    # auto-detect: try plain first, then source
-    try { return Invoke-RconPlain -command $command } catch { Write-Log "RCON plain failed: $_" 'DEBUG' }
-    try { return Invoke-RconSource -command $command } catch { Write-Log "RCON source failed: $_" 'DEBUG' }
+    # auto-detect: try source first, then plain
+    try {
+        $src = Invoke-RconSource -command $command
+        if ($src -and $src.Trim().Length -gt 0) { return $src }
+        Write-Log "RCON source returned empty response, trying plain protocol" 'DEBUG'
+    } catch { Write-Log "RCON source failed: $_" 'DEBUG' }
+    try {
+        $plain = Invoke-RconPlain -command $command
+        if ($plain -and $plain.Trim().Length -gt 0) { return $plain }
+        Write-Log "RCON plain returned empty response" 'DEBUG'
+    } catch { Write-Log "RCON plain failed: $_" 'DEBUG' }
     throw 'No RCON protocol succeeded'
 }
 
@@ -820,6 +846,18 @@ function Show-UI {
     }
     $lines += ("Controls: " + ($controls -join ' ')).PadRight($width)
 
+    # If there is a recent RCON response, show a short preview
+    if ($script:LastRconResponse) {
+        $lines += ''.PadRight($width)
+        $lines += ('RCON RESPONSE:').PadRight($width)
+        $respLines = $script:LastRconResponse -split "\r?\n"
+        $maxPreview = 6
+        for ($i = 0; $i -lt [Math]::Min($respLines.Count, $maxPreview); $i++) {
+            $lines += ($respLines[$i]).PadRight($width)
+        }
+        if ($respLines.Count -gt $maxPreview) { $lines += ('...(truncated)').PadRight($width) }
+    }
+
     # Overwrite the top portion of the console to avoid a full clear
     try {
         [Console]::SetCursorPosition(0,0)
@@ -918,6 +956,48 @@ function Start-Watchdog {
                     'Stop'   { $global:LastAction = "Manual stop requested at $(Get-Date)"; Stop-Eco -Manual }
                     'Start'  { $global:LastAction = "Manual start requested at $(Get-Date)"; Start-Eco }
                     'Logs'   { $script:DisplayMode = 'LOGS' }
+                    'Rcon'   {
+                        $global:LastAction = "Manual RCON command at $(Get-Date)"
+                        try {
+                            $cmd = Read-Host 'Enter RCON command'
+                            if ($cmd -and $cmd.Trim().Length -gt 0) {
+                                $resp = Invoke-Rcon -command $cmd
+
+                                # Normalize response to string
+                                if ($resp -is [byte[]]) {
+                                    $respStr = [System.Text.Encoding]::UTF8.GetString($resp)
+                                } elseif ($resp -is [string]) {
+                                    $respStr = $resp
+                                } else {
+                                    $respStr = ($resp | Out-String)
+                                }
+                                $respStr = $respStr.TrimEnd()
+
+                                # Save for UI preview and log a short summary
+                                $script:LastRconResponse = $respStr
+                                if ($respStr.Length -gt 200) { $short = $respStr.Substring(0,200) + '...' } else { $short = $respStr }
+                                Write-Log "RCON: $cmd => $short"
+                                # Also write the full response to the log for later inspection
+                                try { Write-Log "RCON RESPONSE: $cmd => `n$respStr" 'INFO' } catch {}
+                                $global:LastAction = "RCON: $cmd -> $short"
+
+                                # Immediately refresh UI to show response preview
+                                try { Show-UI -Force } catch {}
+
+                                # If viewing logs, also print full response now
+                                if ($script:DisplayMode -ne 'UI') {
+                                    Write-Host "--- RCON RESPONSE ---" -ForegroundColor Cyan
+                                    $respStr -split "\r?\n" | ForEach-Object { Write-Host $_ }
+                                    Write-Host "--- END RCON RESPONSE ---" -ForegroundColor Cyan
+                                }
+                            } else {
+                                $global:LastAction = 'RCON: (cancelled)'
+                            }
+                        } catch {
+                            Write-Log "RCON command failed: $_" 'ERROR'
+                            $global:LastAction = "RCON failed: $_"
+                        }
+                    }
                     'Back'   { $script:DisplayMode = 'UI'; $script:LogInitialized = $false }
                     'Quit'   { $global:LastAction = "Quit requested at $(Get-Date)"; Stop-Eco -Manual; $global:ShouldQuit = $true; break }
                     default  { Write-Log "Unknown action mapped: $action" 'DEBUG' }
