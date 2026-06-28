@@ -47,9 +47,9 @@ Checklist before committing a script
 - Script uses `$PSScriptRoot` for relative paths.
 - Pester tests added where behavior is non-trivial.
 
-Notes
-- These are guidelines to improve readability, safety, and cross-environment compatibility. When in doubt, prefer explicitness over convenience.
-
+Notes:
+ The helper above uses `Get-Verb` to determine approved verbs and a small built-in synonyms mapping derived from the Microsoft "Synonyms to avoid" guidance. Extend the `$synonyms` table for project-specific cases.
+ Important: do NOT add backwards-compatible wrapper functions (compatibility shims) in new code. Instead, update call sites to use the approved-verb function name, or provide an explicit migration step or automated codemod that updates dependent scripts and tests. Agents and contributors must not introduce shim functions that mask underlying API changes.
 **Validate Approved Verbs**
 - **Purpose:** Provide a simple lint helper to detect function names that use non-approved or "synonym" verbs (the "Synonyms to avoid" category on the Microsoft approved verbs page) and suggest the appropriate approved verb.
 - **Usage:** Run the snippet below against your scripts before committing. It reports functions whose verb part is not an approved verb and suggests replacements where a common synonym is detected.

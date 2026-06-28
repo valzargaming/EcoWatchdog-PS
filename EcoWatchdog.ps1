@@ -24,18 +24,16 @@
     Stop-Eco             : Cooperative shutdown (RCON + signal + timeout).
     Backup-DB            : Create a DB backup in `backups/`.
     Restore-LatestBackup : Restore the most recent DB backup.
-    Repair-Eco           : Recovery flow (was `Recover-Eco`), attempts restart and restore.
+    Repair-Server        : Recovery flow (was `Recover-Eco`), attempts restart and restore.
     Test-Health          : Perform HTTP health probe against `HealthUrl`.
     Invoke-Health        : Run health probe and update state.
     Show-UI              : Console UI for manual control.
     Start-Watchdog       : Main runtime loop (guarded during unit tests).
 
 .NOTES
-    - Configuration at top of file. Adjust RCON settings as needed.
+    - Configuration at top of file should not be changed. They are overridden by
+        EcoWatchdog.local.ps1 or by the server's Configs/* files.
     - Log rotation keeps historical logs up to configured limit.
-    - Several public functions were renamed to approved PowerShell verbs
-        (e.g., `Repair-Eco` replaces older `Recover-*` names). Update caller
-        scripts if you rely on older names.
 #>
 
 # ------------------------------
@@ -70,9 +68,16 @@ $Config = [ordered]@{
     MaxLogBackups            = 5
     HealthUrl                = 'http://127.0.0.1:3001/'
     HealthIntervalSeconds    = 600            # 10 minutes
+    # Automatic health poll interval (seconds) and failure threshold
+    HealthPollIntervalSeconds = 120            # 2 minutes
+    HealthFailureThreshold    = 5
     HealthTimeoutSeconds     = 5
     RecoveryBackupsToKeep    = 3
     ShutdownTimeoutSeconds   = 120
+    # Discord webhook for automatic failure notifications (leave empty to disable)
+    DiscordWebhookUrl        = $null
+    # If true, send notifications for unexpected automatic failures/start failures
+    DiscordNotifyOnFailure   = $true
 
     # RCON configuration
     RconHost                 = '127.0.0.1'
@@ -126,9 +131,42 @@ function Set-LastFunction {
 function Write-Log { param([string]$message, [string]$level = 'INFO')
     try { Add-Content -Path $Config.LogFile -Value ("[$((Get-Date).ToString('s'))] [$level] $message") -ErrorAction SilentlyContinue } catch {}
 }
+
+# ------------------------------
+# Notifications
+# ------------------------------
+function Send-DiscordWebhook {
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [string]$Username = 'EcoWatchdog',
+        [string]$AvatarUrl = $null
+    )
+    if (-not $Config.DiscordWebhookUrl) { return }
+    try {
+        $payload = @{ content = $Message }
+        if ($Username) { $payload.username = $Username }
+        if ($AvatarUrl) { $payload.avatar_url = $AvatarUrl }
+        $json = $payload | ConvertTo-Json -Depth 3
+        Invoke-RestMethod -Uri $Config.DiscordWebhookUrl -Method Post -Body $json -ContentType 'application/json' -TimeoutSec 10 -ErrorAction Stop
+        Write-Log 'Discord webhook sent' 'DEBUG'
+    } catch {
+        Write-Log "Failed sending Discord webhook: $_" 'WARN'
+    }
+}
 # ------------------------------
 # Ensure directories exist
 if (-not (Test-Path $Config.BackupDir)) { New-Item -ItemType Directory -Path $Config.BackupDir | Out-Null }
+# Load local overrides from EcoWatchdog.local.ps1 if present. This file can set
+# values on the $Config ordered hashtable (for example DiscordWebhookUrl).
+$localOverrides = Join-Path $ScriptDir 'EcoWatchdog.local.ps1'
+if (Test-Path $localOverrides) {
+    try {
+        . $localOverrides
+        Write-Log "Loaded local overrides from $localOverrides" 'DEBUG'
+    } catch {
+        Write-Log "Failed loading local overrides ($localOverrides): $_" 'WARN'
+    }
+}
 # Load RCON password from server network configuration if present.
 # This keeps secrets in the server config and avoids environment/local files.
 $networkCfg = Join-Path $ScriptDir 'Configs\\Network.eco'
@@ -751,6 +789,8 @@ function Repair-Server {
     Write-Log "Recovery complete (backup: $backup)"
 }
 
+# NOTE: Removed compatibility wrapper Repair-Eco — callers updated to Repair-Server
+
 # ------------------------------
 # Health checks
 # ------------------------------
@@ -760,8 +800,26 @@ function Test-Health {
 }
 
 function Invoke-Health {
+    param([switch]$Automatic)
     Set-LastFunction
-    if (Test-Health) { $global:LastHealth = 'OK' } else { $global:LastHealth = 'FAIL'; Set-State [EcoState]::FAILED }
+    $prevHealth = $global:LastHealth
+    if (Test-Health) {
+        $global:LastHealth = 'OK'
+        # If this is the first successful automatic check after failures, notify
+        if ($Automatic -and ($prevHealth -eq 'FAIL') -and $Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+            $msg = "[Recover] Server health restored automatically at $(Get-Date) on host $env:COMPUTERNAME"
+            Send-DiscordWebhook -Message $msg
+            Write-Log 'Sent Discord notification for automatic health recovery' 'INFO'
+        }
+    } else {
+        $global:LastHealth = 'FAIL'
+        Set-State [EcoState]::FAILED
+        if ($Automatic -and $Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+            $msg = "[Alert] Server health check failed automatically at $(Get-Date) on host $env:COMPUTERNAME - attempting recovery"
+            Send-DiscordWebhook -Message $msg
+            Write-Log 'Sent Discord notification for automatic health failure' 'INFO'
+        }
+    }
     Write-Log "Health: $global:LastHealth"
 }
 
@@ -877,6 +935,8 @@ function Start-Watchdog {
     Start-Eco
 
     $script:lastHealthCheck = Get-Date
+    # Consecutive automatic health failure counter
+    $script:ConsecutiveHealthFails = 0
     # Display mode controls what is shown to the operator: 'UI' or 'LOGS'
     $script:DisplayMode = 'UI'
 
@@ -952,7 +1012,7 @@ function Start-Watchdog {
                 $action = $binding.Action
                 switch ($action) {
                     'Health' { $global:LastAction = "Manual health check at $(Get-Date)"; Invoke-Health }
-                    'Repair' { $global:LastAction = "Manual repair initiated at $(Get-Date)"; Repair-Eco }
+                    'Repair' { $global:LastAction = "Manual repair initiated at $(Get-Date)"; Repair-Server }
                     'Stop'   { $global:LastAction = "Manual stop requested at $(Get-Date)"; Stop-Eco -Manual }
                     'Start'  { $global:LastAction = "Manual start requested at $(Get-Date)"; Start-Eco }
                     'Logs'   { $script:DisplayMode = 'LOGS' }
@@ -1005,9 +1065,18 @@ function Start-Watchdog {
             }
         }
 
-        # periodic health check
-        if ( ((Get-Date) - $script:lastHealthCheck).TotalSeconds -ge $Config.HealthIntervalSeconds ) {
-            Invoke-Health
+        # periodic automatic health poll (separate from any manual checks)
+        if ( ((Get-Date) - $script:lastHealthCheck).TotalSeconds -ge $Config.HealthPollIntervalSeconds ) {
+            Invoke-Health -Automatic
+            if ($global:LastHealth -eq 'FAIL') { $script:ConsecutiveHealthFails = ($script:ConsecutiveHealthFails + 1) } else { $script:ConsecutiveHealthFails = 0 }
+            Write-Log "Consecutive health failures: $($script:ConsecutiveHealthFails)" 'DEBUG'
+            # If threshold reached and server is in FAILED state, attempt automatic start
+            if (($script:ConsecutiveHealthFails -ge $Config.HealthFailureThreshold) -and ($global:State -eq [EcoState]::FAILED) -and -not $global:ManualStopped) {
+                Write-Log "Health failed $($script:ConsecutiveHealthFails) times; attempting automatic Start-Eco" 'WARN'
+                $global:LastAutoAction = "Auto start executed at $(Get-Date) due to consecutive health failures"
+                Start-Eco
+                $script:ConsecutiveHealthFails = 0
+            }
             $script:lastHealthCheck = Get-Date
         }
 
@@ -1015,8 +1084,13 @@ function Start-Watchdog {
         if ($global:State -eq [EcoState]::RUNNING) {
             if ($global:EcoProcess -and $global:EcoProcess.HasExited) {
                 Write-Log 'Detected process exit " initiating recovery' 'WARN'
+                if ($Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+                    $msg = "[Alert] Server process exited unexpectedly at $(Get-Date) on host $env:COMPUTERNAME - attempting auto-repair"
+                    Send-DiscordWebhook -Message $msg
+                    Write-Log 'Sent Discord notification for unexpected process exit' 'INFO'
+                }
                 $global:LastAutoAction = "Auto repair initiated at $(Get-Date)"
-                Repair-Eco
+                Repair-Server
             }
         }
 
@@ -1027,6 +1101,14 @@ function Start-Watchdog {
                 $global:LastAutoAction = "Scheduled start executed at $(Get-Date)"
                 $global:ScheduledStart = $null
                 Start-Eco
+                Start-Sleep -Seconds 5
+                if ($global:State -ne [EcoState]::RUNNING) {
+                    if ($Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+                        $msg = "[Alert] Scheduled start failed at $(Get-Date) on host $env:COMPUTERNAME"
+                        Send-DiscordWebhook -Message $msg
+                        Write-Log 'Sent Discord notification for failed scheduled start' 'INFO'
+                    }
+                }
             }
         }
 
@@ -1048,16 +1130,37 @@ function Start-Watchdog {
         }
 
         # If both the state machine and health probe indicate failure, and the
-        # server was not explicitly stopped by an operator/script, attempt an
-        # automatic start after a short delay. This avoids fighting a manual stop.
+        # server was not explicitly stopped by an operator/script, attempt recovery.
+        # If a process is present we attempt a Repair (stop/restore/start). Otherwise
+        # attempt an automatic Start.
         if (($global:State -eq [EcoState]::FAILED) -and ($global:LastHealth -eq 'FAIL') -and -not $global:ManualStopped) {
-                Write-Log 'Combined state+health failure detected " scheduling auto-start in 30s' 'WARN'
+            Write-Log 'Combined state+health failure detected; will attempt recovery in 30s' 'WARN'
             Start-Sleep -Seconds 30
             # Re-evaluate before attempting
-            if (($global:State -eq [EcoState]::FAILED) -and ($global:LastHealth -eq 'FAIL') -and -not $global:ManualStopped -and -not (Get-EcoProcess)) {
-                Write-Log 'Performing automatic Start-Eco due to persistent failure' 'INFO'
-                $global:LastAutoAction = "Auto start executed at $(Get-Date)"
-                Start-Eco
+            if (($global:State -eq [EcoState]::FAILED) -and ($global:LastHealth -eq 'FAIL') -and -not $global:ManualStopped) {
+                $existing = Get-EcoProcess
+                if ($existing) {
+                    Write-Log 'Process exists but health failed; attempting repair' 'INFO'
+                    $global:LastAutoAction = "Auto repair initiated at $(Get-Date)"
+                    if ($Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+                        $msg = "[Alert] Automatic repair initiated at $(Get-Date) on host $env:COMPUTERNAME"
+                        Send-DiscordWebhook -Message $msg
+                        Write-Log 'Sent Discord notification for automatic repair' 'INFO'
+                    }
+                    Repair-Server
+                } else {
+                    Write-Log 'No process found; performing automatic Start-Eco due to persistent failure' 'INFO'
+                    $global:LastAutoAction = "Auto start executed at $(Get-Date)"
+                    Start-Eco
+                    Start-Sleep -Seconds 5
+                    if ($global:State -ne [EcoState]::RUNNING) {
+                        if ($Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+                            $msg = "[Alert] Automatic start failed at $(Get-Date) on host $env:COMPUTERNAME"
+                            Send-DiscordWebhook -Message $msg
+                            Write-Log 'Sent Discord notification for failed automatic start' 'INFO'
+                        }
+                    }
+                }
             }
         }
 
