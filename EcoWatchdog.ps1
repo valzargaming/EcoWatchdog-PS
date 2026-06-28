@@ -1071,7 +1071,7 @@ function Start-Watchdog {
                             $global:LastAction = "RCON failed: $_"
                         }
                     }
-                    'Back'   { $script:DisplayMode = 'UI'; $script:LogInitialized = $false }
+                    'Back'   { Clear-Host; $script:UIInitialized = $false; $script:DisplayMode = 'UI'; $script:LogInitialized = $false }
                     'Quit'   { $global:LastAction = "Quit requested at $(Get-Date)"; Stop-Eco -Manual; $global:ShouldQuit = $true; break }
                     default  { Write-Log "Unknown action mapped: $action" 'DEBUG' }
                 }
