@@ -1096,7 +1096,7 @@ function Start-Watchdog {
         if ( ((Get-Date) - $script:lastHealthCheck).TotalSeconds -ge $Config.HealthPollIntervalSeconds ) {
             Invoke-Health -Automatic
             if ($global:LastHealth -eq 'FAIL') { $script:ConsecutiveHealthFails = ($script:ConsecutiveHealthFails + 1) } else { $script:ConsecutiveHealthFails = 0 }
-            Write-Log "Consecutive health failures: $($script:ConsecutiveHealthFails)" 'DEBUG'
+            if ($script:ConsecutiveHealthFails -gt 0) { Write-Log "Consecutive health failures: $($script:ConsecutiveHealthFails)" 'DEBUG' }
             # If threshold reached and server is in FAILED state, attempt automatic start
             if (($script:ConsecutiveHealthFails -ge $Config.HealthFailureThreshold) -and ($global:State -eq [EcoState]::FAILED) -and -not $global:ManualStopped) {
                 Write-Log "Health failed $($script:ConsecutiveHealthFails) times; threshold reached; attempting automatic Start-Eco" 'WARN'
