@@ -128,16 +128,44 @@ function Write-Log { param([string]$message, [string]$level = 'INFO')
 if (-not (Test-Path $Config.BackupDir)) { New-Item -ItemType Directory -Path $Config.BackupDir | Out-Null }
 # Load RCON password from server network configuration if present.
 # This keeps secrets in the server config and avoids environment/local files.
-if (-not $Config.RconPassword) {
-    $networkCfg = Join-Path $ScriptDir 'Configs\\Network.eco'
-    if (Test-Path $networkCfg) {
-        try {
-            $raw = Get-Content -Path $networkCfg -Raw -ErrorAction Stop
-            $net = $raw | ConvertFrom-Json -ErrorAction Stop
-            if ($net.RconPassword) { $Config.RconPassword = $net.RconPassword; Write-Log 'Loaded RCON password from Configs/Network.eco' 'DEBUG' }
-        } catch {
-            Write-Log "Failed parsing network config for RCON password: $_" 'WARN'
+$networkCfg = Join-Path $ScriptDir 'Configs\\Network.eco'
+if (Test-Path $networkCfg) {
+    try {
+        $raw = Get-Content -Path $networkCfg -Raw -ErrorAction Stop
+        $net = $raw | ConvertFrom-Json -ErrorAction Stop
+
+        # RCON password: only override if not already configured
+        if (-not $Config.RconPassword -and $net.RconPassword) {
+            $Config.RconPassword = $net.RconPassword
+            Write-Log 'Loaded RCON password from Configs/Network.eco' 'DEBUG'
         }
+
+        # RCON port: prefer Network.eco RconServerPort
+        if ($null -ne $net.RconServerPort) {
+            try { $Config.RconPort = [int]$net.RconServerPort } catch { $Config.RconPort = $net.RconServerPort }
+            Write-Log "Loaded RCON port from Configs/Network.eco: $($Config.RconPort)" 'DEBUG'
+        }
+
+        # RCON host/address: default to 127.0.0.1 when empty or 'Any'
+        $rhost = $net.RconIPAddress
+        if (-not $rhost -or ($rhost -as [string]).Trim().Length -eq 0 -or $rhost -match '(?i)^Any$') { $rhost = '127.0.0.1' }
+        $Config.RconHost = $rhost
+        Write-Log "Loaded RCON host from Configs/Network.eco: $($Config.RconHost)" 'DEBUG'
+
+        # Web server host/port for health checks
+        $webHost = $net.WebServerUrl
+        if (-not $webHost -or ($webHost -as [string]).Trim().Length -eq 0) { $webHost = '127.0.0.1' }
+        # Strip http/https scheme if present so we don't double up when building URL
+        $webHostNoScheme = ($webHost -as [string]) -replace '^(?i)https?://', ''
+
+        if ($null -ne $net.WebServerPort) {
+            try { $port = [int]$net.WebServerPort } catch { $port = $net.WebServerPort }
+            $Config.HealthUrl = "http://$webHostNoScheme`:$port/"
+            Write-Log "Loaded WebServerUrl/Port from Configs/Network.eco: $webHostNoScheme`:$port (HealthUrl set)" 'DEBUG'
+        }
+
+    } catch {
+        Write-Log "Failed parsing network config: $_" 'WARN'
     }
 }
 
