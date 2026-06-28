@@ -484,6 +484,8 @@ function Set-State { param($new)
 function Start-Eco {
     Set-LastFunction
     if ($global:State -in @([EcoState]::RUNNING, [EcoState]::STARTING)) { return }
+    # Reset consecutive health-failure counter when attempting a start
+    try { $script:ConsecutiveHealthFails = 0 } catch {}
     # Clear manual-stop when attempting an explicit start
     $global:ManualStopped = $false
         # Clear any scheduled start because we're starting now
@@ -738,6 +740,8 @@ function Repair-Server {
     Set-LastFunction
     # Record when a repair was initiated to avoid triggering duplicate automatic alerts
     $global:LastRepairTime = Get-Date
+    # Reset consecutive health-failure counter when a repair is initiated
+    try { $script:ConsecutiveHealthFails = 0 } catch {}
     Set-State [EcoState]::RECOVERING
     Write-Log 'Recovery initiated'
     $backup = Backup-Database
@@ -825,12 +829,22 @@ function Invoke-Health {
             if ($delta.TotalSeconds -lt $suppressWindow) { $recentRepair = $true }
         }
 
-        if ($Automatic -and -not $recentRepair -and $Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
-            $msg = "[Alert] Server health check failed automatically at $(Get-Date) on host $env:COMPUTERNAME - attempting recovery"
-            Send-DiscordWebhook -Message $msg
-            Write-Log 'Sent Discord notification for automatic health failure' 'INFO'
-        } elseif ($Automatic -and $recentRepair) {
+        if ($Automatic -and $recentRepair) {
             Write-Log "Suppressed automatic health failure notification; recent repair at $($global:LastRepairTime) within $suppressWindow seconds" 'DEBUG'
+        } else {
+            # Do not send Discord alerts immediately on every automatic check —
+            # wait until the periodic poll increments the consecutive-failure
+            # counter and decides to attempt recovery. Manual (non-automatic)
+            # checks still notify immediately.
+            if (-not $Automatic) {
+                if ($Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+                    $msg = "[Alert] Server health check failed at $(Get-Date) on host $env:COMPUTERNAME"
+                    Send-DiscordWebhook -Message $msg
+                    Write-Log 'Sent Discord notification for manual health failure' 'INFO'
+                }
+            } else {
+                Write-Log 'Automatic health failure recorded; awaiting consecutive-failure threshold before notifying' 'DEBUG'
+            }
         }
     }
     Write-Log "Health: $global:LastHealth"
@@ -1085,7 +1099,24 @@ function Start-Watchdog {
             Write-Log "Consecutive health failures: $($script:ConsecutiveHealthFails)" 'DEBUG'
             # If threshold reached and server is in FAILED state, attempt automatic start
             if (($script:ConsecutiveHealthFails -ge $Config.HealthFailureThreshold) -and ($global:State -eq [EcoState]::FAILED) -and -not $global:ManualStopped) {
-                Write-Log "Health failed $($script:ConsecutiveHealthFails) times; attempting automatic Start-Eco" 'WARN'
+                Write-Log "Health failed $($script:ConsecutiveHealthFails) times; threshold reached; attempting automatic Start-Eco" 'WARN'
+
+                # Determine if a recent repair was initiated to avoid duplicate alerts
+                $suppressWindow = if ($Config.RepairSuppressWindowSeconds) { $Config.RepairSuppressWindowSeconds } else { 60 }
+                $recentRepair = $false
+                if ($global:LastRepairTime) {
+                    $delta = (Get-Date) - $global:LastRepairTime
+                    if ($delta.TotalSeconds -lt $suppressWindow) { $recentRepair = $true }
+                }
+
+                if ($Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl -and -not $recentRepair) {
+                    $msg = "[Alert] Server has failed health check $($script:ConsecutiveHealthFails) times at $(Get-Date) on host $env:COMPUTERNAME - attempting automatic recovery"
+                    Send-DiscordWebhook -Message $msg
+                    Write-Log 'Sent Discord notification for automatic recovery attempt' 'INFO'
+                } elseif ($recentRepair) {
+                    Write-Log "Suppressed automatic recovery notification; recent repair at $($global:LastRepairTime) within $suppressWindow seconds" 'DEBUG'
+                }
+
                 $global:LastAutoAction = "Auto start executed at $(Get-Date) due to consecutive health failures"
                 Start-Eco
                 $script:ConsecutiveHealthFails = 0
