@@ -736,6 +736,8 @@ function Stop-Eco {
 
 function Repair-Server {
     Set-LastFunction
+    # Record when a repair was initiated to avoid triggering duplicate automatic alerts
+    $global:LastRepairTime = Get-Date
     Set-State [EcoState]::RECOVERING
     Write-Log 'Recovery initiated'
     $backup = Backup-Database
@@ -814,10 +816,21 @@ function Invoke-Health {
     } else {
         $global:LastHealth = 'FAIL'
         Set-State [EcoState]::FAILED
-        if ($Automatic -and $Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+
+        # Suppress automatic notifications if a repair was recently initiated
+        $suppressWindow = if ($Config.RepairSuppressWindowSeconds) { $Config.RepairSuppressWindowSeconds } else { 60 }
+        $recentRepair = $false
+        if ($global:LastRepairTime) {
+            $delta = (Get-Date) - $global:LastRepairTime
+            if ($delta.TotalSeconds -lt $suppressWindow) { $recentRepair = $true }
+        }
+
+        if ($Automatic -and -not $recentRepair -and $Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
             $msg = "[Alert] Server health check failed automatically at $(Get-Date) on host $env:COMPUTERNAME - attempting recovery"
             Send-DiscordWebhook -Message $msg
             Write-Log 'Sent Discord notification for automatic health failure' 'INFO'
+        } elseif ($Automatic -and $recentRepair) {
+            Write-Log "Suppressed automatic health failure notification; recent repair at $($global:LastRepairTime) within $suppressWindow seconds" 'DEBUG'
         }
     }
     Write-Log "Health: $global:LastHealth"
