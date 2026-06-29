@@ -819,6 +819,22 @@ function Invoke-Health {
     $prevHealth = $global:LastHealth
     if (Test-Health) {
         $global:LastHealth = 'OK'
+        # If the watchdog previously marked the server FAILED, promote it back to RUNNING
+        if ($global:State -eq [EcoState]::FAILED) {
+            $procInfo = Get-EcoProcess
+            if ($procInfo) {
+                try {
+                    $global:EcoProcess = Get-Process -Id $procInfo.ProcessId -ErrorAction SilentlyContinue
+                    Write-Log "Health recovered: attached to existing Eco PID $($procInfo.ProcessId)" 'INFO'
+                } catch {
+                    Write-Log "Health recovered but failed to attach to process: $_" 'WARN'
+                }
+            } else {
+                Write-Log 'Health recovered but no Eco process found to attach' 'INFO'
+            }
+            Set-State [EcoState]::RUNNING
+        }
+
         # If this is the first successful automatic check after failures, notify
         if ($Automatic -and ($prevHealth -eq 'FAIL') -and $Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
             $msg = "[Recover] Server health restored automatically at $(Get-Date) on host $env:COMPUTERNAME"
