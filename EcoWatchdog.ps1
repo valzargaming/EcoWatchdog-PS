@@ -74,6 +74,8 @@ $Config = [ordered]@{
     HealthTimeoutSeconds     = 5
     RecoveryBackupsToKeep    = 3
     ShutdownTimeoutSeconds   = 120
+    # When deciding whether the server was "recently running", use this window (seconds)
+    RecentProcessWindowSeconds = 360
     # Discord webhook for automatic failure notifications (leave empty to disable)
     DiscordWebhookUrl        = $null
     # If true, send notifications for unexpected automatic failures/start failures
@@ -461,9 +463,13 @@ function Invoke-Rcon {
 function Get-EcoProcess {
     Set-LastFunction
     $exe = $Config.EcoExe
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    $proc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -eq $exe) } |
         Select-Object -First 1
+    if ($proc) {
+        try { $script:LastProcessSeen = Get-Date } catch {}
+    }
+    return $proc
 }
 
 function Set-State { param($new)
@@ -502,11 +508,13 @@ function Start-Eco {
             Write-Log "Attached to existing Eco PID $($existing.ProcessId)"
                 # If an attached process exists, clear scheduled start
                 $global:ScheduledStart = $null
+            try { $script:LastProcessSeen = Get-Date } catch {}
             return
         }
         $p = Start-Process -FilePath $Config.EcoExe -PassThru
         Start-Sleep -Seconds 2
         $global:EcoProcess = $p
+        try { $script:LastProcessSeen = Get-Date } catch {}
         Set-State [EcoState]::RUNNING
         Write-Log "Started Eco PID $($p.Id)"
     } catch { Write-Log "Start-Eco failed: $_" 'ERROR'; Set-State [EcoState]::FAILED } finally { Pop-Location }
@@ -1097,9 +1105,9 @@ function Start-Watchdog {
             Invoke-Health -Automatic
             if ($global:LastHealth -eq 'FAIL') { $script:ConsecutiveHealthFails = ($script:ConsecutiveHealthFails + 1) } else { $script:ConsecutiveHealthFails = 0 }
             if ($script:ConsecutiveHealthFails -gt 0) { Write-Log "Consecutive health failures: $($script:ConsecutiveHealthFails)" 'DEBUG' }
-            # If threshold reached and server is in FAILED state, attempt automatic start
-            if (($script:ConsecutiveHealthFails -ge $Config.HealthFailureThreshold) -and ($global:State -eq [EcoState]::FAILED) -and -not $global:ManualStopped) {
-                Write-Log "Health failed $($script:ConsecutiveHealthFails) times; threshold reached; attempting automatic Start-Eco" 'WARN'
+            # If threshold reached, evaluate recovery regardless of state.
+            if (($script:ConsecutiveHealthFails -ge $Config.HealthFailureThreshold) -and -not $global:ManualStopped) {
+                Write-Log "Health failed $($script:ConsecutiveHealthFails) times; threshold reached; evaluating recovery" 'WARN'
 
                 # Determine if a recent repair was initiated to avoid duplicate alerts
                 $suppressWindow = if ($Config.RepairSuppressWindowSeconds) { $Config.RepairSuppressWindowSeconds } else { 60 }
@@ -1117,8 +1125,38 @@ function Start-Watchdog {
                     Write-Log "Suppressed automatic recovery notification; recent repair at $($global:LastRepairTime) within $suppressWindow seconds" 'DEBUG'
                 }
 
-                $global:LastAutoAction = "Auto start executed at $(Get-Date) due to consecutive health failures"
-                Start-Eco
+                # If a process exists attempt a repair. If no process exists but one
+                # was seen recently, try a normal Start-Eco once before attempting
+                # a full Repair-Server. Otherwise perform a Start-Eco.
+                $existing = Get-EcoProcess
+                if ($existing) {
+                    Write-Log 'Process exists but health failed; attempting Repair-Server' 'INFO'
+                    $global:LastAutoAction = "Auto repair initiated at $(Get-Date)"
+                    Repair-Server
+                } else {
+                    $recentlyRunning = $false
+                    if ($script:LastProcessSeen) {
+                        try { if (((Get-Date) - $script:LastProcessSeen).TotalSeconds -lt $Config.RecentProcessWindowSeconds) { $recentlyRunning = $true } } catch {}
+                    }
+
+                    if ($recentlyRunning) {
+                        Write-Log 'Server was recently running; attempting normal Start-Eco once before repair' 'INFO'
+                        $global:LastAutoAction = "Auto start executed at $(Get-Date) due to consecutive health failures"
+                        Start-Eco
+                        Start-Sleep -Seconds 5
+                        if ($global:State -ne [EcoState]::RUNNING) {
+                            Write-Log 'Normal start failed; falling back to Repair-Server' 'WARN'
+                            $global:LastAutoAction = "Auto repair initiated at $(Get-Date) after failed start"
+                            Repair-Server
+                        }
+                    } else {
+                        Write-Log 'No process found; attempting automatic Start-Eco' 'INFO'
+                        $global:LastAutoAction = "Auto start executed at $(Get-Date) due to consecutive health failures"
+                        Start-Eco
+                    }
+                }
+
+                # Reset the consecutive-failure counter after attempting recovery
                 $script:ConsecutiveHealthFails = 0
             }
             $script:lastHealthCheck = Get-Date
