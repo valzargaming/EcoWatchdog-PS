@@ -1122,7 +1122,24 @@ function Start-Watchdog {
             if ($global:LastHealth -eq 'FAIL') { $script:ConsecutiveHealthFails = ($script:ConsecutiveHealthFails + 1) } else { $script:ConsecutiveHealthFails = 0 }
             if ($script:ConsecutiveHealthFails -gt 0) { Write-Log "Consecutive health failures: $($script:ConsecutiveHealthFails)" 'DEBUG' }
             # If threshold reached, evaluate recovery regardless of state.
-            if (($script:ConsecutiveHealthFails -ge $Config.HealthFailureThreshold) -and -not $global:ManualStopped) {
+            # Additionally: if this is the first automatic health failure and it
+            # occurred within two minutes of the configured AutoShutdownHour,
+            # treat it as threshold reached (do not wait for consecutive failures).
+            $withinAutoShutdownWindow = $false
+            try {
+                $maintPath = Join-Path $ScriptDir 'Configs\Maintenance.eco'
+                if (Test-Path $maintPath) {
+                    $maint = Get-Content -Path $maintPath -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    if ($maint -and $maint.AutoShutdownHour -ne $null) {
+                        $hour = [int]$maint.AutoShutdownHour
+                        $scheduled = Get-Date -Hour $hour -Minute 0 -Second 0
+                        $deltaMin = [math]::Abs((Get-Date).Subtract($scheduled).TotalMinutes)
+                        if ($deltaMin -le 5) { $withinAutoShutdownWindow = $true }
+                    }
+                }
+            } catch { $withinAutoShutdownWindow = $false }
+
+            if ( ( ($script:ConsecutiveHealthFails -ge $Config.HealthFailureThreshold) -or (($script:ConsecutiveHealthFails -eq 1) -and $withinAutoShutdownWindow) ) -and -not $global:ManualStopped) {
                 Write-Log "Health failed $($script:ConsecutiveHealthFails) times; threshold reached; evaluating recovery" 'WARN'
 
                 # Determine if a recent repair was initiated to avoid duplicate alerts
