@@ -796,6 +796,20 @@ function Repair-Server {
         if ($global:State -ne [EcoState]::RUNNING) {
             Set-State [EcoState]::FAILED
             Write-Log 'Recovery failed after restore' 'ERROR'
+
+            # Notify via Discord if configured that recovery was unrecoverable
+            try {
+                if ($Config.DiscordNotifyOnFailure -and $Config.DiscordWebhookUrl) {
+                    $msg = "[Fatal] Recovery failed irrecoverably at $(Get-Date) on host $env:COMPUTERNAME. Watchdog exiting."
+                    Send-DiscordWebhook -Message $msg
+                    Write-Log 'Sent Discord notification for unrecoverable failure' 'INFO'
+                }
+            } catch { Write-Log "Failed sending unrecoverable Discord notification: $_" 'WARN' }
+
+            # Signal the main loop to quit and exit the process so the script closes
+            try { $global:ShouldQuit = $true } catch {}
+            Write-Log 'Unrecoverable failure: exiting watchdog' 'ERROR'
+            if ($env:UNIT_TEST -ne '1') { Exit 1 }
             return
         }
     }
