@@ -1144,7 +1144,7 @@ function Start-Watchdog {
                 $maintPath = Join-Path $ScriptDir 'Configs\Maintenance.eco'
                 if (Test-Path $maintPath) {
                     $maint = Get-Content -Path $maintPath -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
-                    if ($maint -and $maint.AutoShutdownHour -ne $null) {
+                    if ($maint -and $null -ne $maint.AutoShutdownHour) {
                         $hour = [int]$maint.AutoShutdownHour
                         $scheduled = Get-Date -Hour $hour -Minute 0 -Second 0
                         $deltaMin = [math]::Abs((Get-Date).Subtract($scheduled).TotalMinutes)
