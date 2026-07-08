@@ -509,6 +509,11 @@ function Start-Eco {
                 # If an attached process exists, clear scheduled start
                 $global:ScheduledStart = $null
             try { $script:LastProcessSeen = Get-Date } catch {}
+            try {
+                $msg = "[Info] Attached to existing Eco PID $($existing.ProcessId) at $(Get-Date) on host $env:COMPUTERNAME"
+                Send-DiscordWebhook -Message $msg
+                Write-Log 'Sent Discord notification for attached existing process' 'INFO'
+            } catch { Write-Log "Failed sending Discord notification for attach: $_" 'WARN' }
             return
         }
         $p = Start-Process -FilePath $Config.EcoExe -PassThru
@@ -517,6 +522,11 @@ function Start-Eco {
         try { $script:LastProcessSeen = Get-Date } catch {}
         Set-State [EcoState]::RUNNING
         Write-Log "Started Eco PID $($p.Id)"
+        try {
+            $msg = "[Info] Started Eco PID $($p.Id) at $(Get-Date) on host $env:COMPUTERNAME"
+            Send-DiscordWebhook -Message $msg
+            Write-Log 'Sent Discord notification for start' 'INFO'
+        } catch { Write-Log "Failed sending Discord notification for start: $_" 'WARN' }
     } catch { Write-Log "Start-Eco failed: $_" 'ERROR'; Set-State [EcoState]::FAILED } finally { Pop-Location }
 }
 
@@ -691,7 +701,15 @@ function Stop-Eco {
     param([switch]$Manual)
     Set-LastFunction
     if ($global:State -in @([EcoState]::STOPPED, [EcoState]::STOPPING)) { return }
-    if ($Manual) { $global:ManualStopped = $true; $global:LastAction = "Manual stop requested at $(Get-Date)" }
+    if ($Manual) {
+        $global:ManualStopped = $true
+        $global:LastAction = "Manual stop requested at $(Get-Date)"
+        try {
+            $msg = "[Manual] Stop requested at $(Get-Date) on host $env:COMPUTERNAME"
+            Send-DiscordWebhook -Message $msg
+            Write-Log 'Sent Discord notification for manual stop' 'INFO'
+        } catch { Write-Log "Failed sending Discord notification for manual stop: $_" 'WARN' }
+    }
     Set-State [EcoState]::STOPPING
     try {
         if ($global:EcoProcess -and -not $global:EcoProcess.HasExited) {
