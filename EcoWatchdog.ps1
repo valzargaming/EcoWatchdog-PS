@@ -72,6 +72,16 @@ $Config = [ordered]@{
     HealthPollIntervalSeconds = 120            # 2 minutes
     HealthFailureThreshold    = 5
     HealthTimeoutSeconds     = 5
+    # Admin API base URL for the server web Admin endpoints (no trailing slash)
+    # Defaults to HealthUrl + 'api/Admin' but can be overridden in EcoWatchdog.local.ps1
+    AdminApiBase             = $null
+    # Optional token to send in Authorization header (Bearer token). Leave null to send no auth header.
+    AdminApiToken            = $null
+    # Optional override for API root (e.g. http://127.0.0.1:3001/api/v1). Leave null to derive from HealthUrl.
+    ApiBase                  = $null
+    # Optional API auth token (for /api/v1 endpoints). If left null, the script will try to load
+    # from Configs/Users.eco `APIAuthToken`.
+    ApiAuthToken             = $null
     RecoveryBackupsToKeep    = 3
     ShutdownTimeoutSeconds   = 120
     # When deciding whether the server was "recently running", use this window (seconds)
@@ -110,6 +120,7 @@ $Config.KeyBindings = [ordered]@{
     S = @{ Action = 'Stop';   Label = 'Stop' }
     A = @{ Action = 'Start';  Label = 'Start' }
     L = @{ Action = 'Logs';   Label = 'Logs' }
+    P = @{ Action = 'Api';    Label = 'API' }
     B = @{ Action = 'Back';   Label = 'Back' }
     Q = @{ Action = 'Quit';   Label = 'Quit' }
 }
@@ -211,6 +222,29 @@ if (Test-Path $networkCfg) {
         Write-Log "Failed parsing network config: $_" 'WARN'
     }
 }
+
+# Load API auth tokens from Configs/Users.eco when available (APIAuthToken, APIAdminAuthToken)
+function Import-UsersApiTokens {
+    Set-LastFunction
+    $usersCfg = Join-Path $ScriptDir 'Configs\Users.eco'
+    if (-not (Test-Path $usersCfg)) { return }
+    try {
+        $raw = Get-Content -Path $usersCfg -Raw -ErrorAction Stop
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        if (-not $Config.ApiAuthToken -and $obj.APIAuthToken) {
+            $Config.ApiAuthToken = $obj.APIAuthToken
+            Write-Log 'Loaded APIAuthToken from Configs/Users.eco' 'DEBUG'
+        }
+        if (-not $Config.AdminApiToken -and $obj.APIAdminAuthToken) {
+            $Config.AdminApiToken = $obj.APIAdminAuthToken
+            Write-Log 'Loaded APIAdminAuthToken from Configs/Users.eco' 'DEBUG'
+        }
+    } catch {
+        Write-Log "Failed parsing Users.eco for API tokens: $_" 'WARN'
+    }
+}
+
+Import-UsersApiTokens
 
 # Load world/save name from Configs/Storage.eco so the watchdog knows current world
 function Import-StorageSaveName {
@@ -952,6 +986,544 @@ function Get-KeyForAction {
     return $null
 }
 
+# ------------------------------
+# Admin API helpers
+# ------------------------------
+function Invoke-AdminApi {
+    param(
+        [string]$Method = 'GET',
+        [string]$Path = '/',
+        $Body = $null
+    )
+    Set-LastFunction
+    # Ensure /api/v1 is the base; derive admin base under /api/v1/admin
+    $apiRoot = $null
+    if ($Config.ApiBase) { $apiRoot = ($Config.ApiBase -replace '/+$','') } else { $apiRoot = ($Config.HealthUrl -replace '/+$','') }
+    if ($apiRoot -notmatch '/api/v1$') { $apiRoot = $apiRoot + '/api/v1' }
+
+    $base = $null
+    if ($Config.AdminApiBase) {
+        $candidate = ($Config.AdminApiBase -replace '/+$','')
+        if ($candidate -match '/api/v1') { $base = $candidate } else { $base = $apiRoot + '/admin' }
+    } else {
+        $base = $apiRoot + '/admin'
+    }
+
+    $url = ($base -replace '/+$','') + '/' + ($Path -replace '^/+','')
+
+    $headers = @{}
+    if ($Config.AdminApiToken) { $headers['X-API-Key'] = $Config.AdminApiToken }
+    elseif ($Config.ApiAuthToken) { $headers['X-API-Key'] = $Config.ApiAuthToken }
+
+    $invokeParams = @{ Uri = $url; Method = $Method; Headers = $headers; ErrorAction = 'Stop' }
+    if ($null -ne $Body -and $Body -ne '') {
+        if ($Body -isnot [string]) { $bodyJson = $Body | ConvertTo-Json -Depth 10 } else { $bodyJson = $Body }
+        $invokeParams['Body'] = $bodyJson
+        $invokeParams['ContentType'] = 'application/json'
+    }
+
+    try {
+        $resp = Invoke-RestMethod @invokeParams
+        $out = $resp | ConvertTo-Json -Depth 10
+        return $out
+    } catch {
+        return "ERROR: $_"
+    }
+}
+
+# Generic game API helper (uses /api/v1 root)
+function Invoke-GameApi {
+    param(
+        [string]$Method = 'GET',
+        [string]$Path = '/',
+        $Body = $null
+    )
+    Set-LastFunction
+    # Ensure /api/v1 is the base
+    $apiRoot = $null
+    if ($Config.ApiBase) { $apiRoot = ($Config.ApiBase -replace '/+$','') } else { $apiRoot = ($Config.HealthUrl -replace '/+$','') }
+    if ($apiRoot -notmatch '/api/v1$') { $apiRoot = $apiRoot + '/api/v1' }
+
+    $base = $apiRoot
+    $url = ($base -replace '/+$','') + '/' + ($Path -replace '^/+','')
+
+    $headers = @{}
+    if ($Config.ApiAuthToken) { $headers['X-API-Key'] = $Config.ApiAuthToken } elseif ($Config.AdminApiToken) { $headers['X-API-Key'] = $Config.AdminApiToken }
+
+    $invokeParams = @{ Uri = $url; Method = $Method; Headers = $headers; ErrorAction = 'Stop' }
+    if ($null -ne $Body -and $Body -ne '') {
+        if ($Body -isnot [string]) { $bodyJson = $Body | ConvertTo-Json -Depth 10 } else { $bodyJson = $Body }
+        $invokeParams['Body'] = $bodyJson
+        $invokeParams['ContentType'] = 'application/json'
+    }
+
+    try {
+        $resp = Invoke-RestMethod @invokeParams
+        $out = $resp | ConvertTo-Json -Depth 10
+        return $out
+    } catch {
+        return "ERROR: $_"
+    }
+}
+
+# Resolve a template by filling common placeholders (`authtoken`, `authtokentype`) and return a path string
+function Resolve-ApiTemplate {
+    param(
+        [string]$Template
+    )
+    Set-LastFunction
+    $template = $Template
+    # For API tokens, use `api_key` query parameter (or X-API-Key header). Replace 'authtoken' placeholders
+    if ($template -match 'authtoken') {
+        $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
+        if (-not $token) { $token = $Config.ApiAuthToken }
+        $enc = [uri]::EscapeDataString($token)
+        # Replace literal 'authtoken' placeholder with 'api_key=<encoded>' and remove authtokentype placeholders
+        $template = $template -replace 'authtoken', "api_key=$enc"
+        $template = $template -replace '([&?])?authtokentype([^&\]]*)', ''
+    }
+    # Remove any leftover authtokentype tokens if present
+    $template = $template -replace 'authtokentype', ''
+    return $template
+}
+
+# Returns a hashtable of API endpoint groups and templates
+function Get-ApiEndpoints {
+    Set-LastFunction
+    return @{
+        'Admin' = @(
+            @{ Method='POST'; Path='admin/set/access?authtoken&authtokentype[&value&password]'; Desc='Set access (public/private/hidden)'} ,
+            @{ Method='GET';  Path='admin/get/access?authtoken&authtokentype'; Desc='Get access'} ,
+            @{ Method='POST'; Path='admin/set/servername?authtoken&authtokentype[&name]'; Desc='Set server name'} ,
+            @{ Method='GET';  Path='admin/get/servername'; Desc='Get server name'} ,
+            @{ Method='POST'; Path='admin/game/export?authtoken&authtokentype'; Desc='Game export'}
+        )
+        'Chat' = @(
+            @{ Method='GET'; Path='chat?authtoken&authtokentype[&startDay&endDay]'; Desc='Get chat'} ,
+            @{ Method='GET'; Path='chat/tag?authtoken&authtokentype[&tag&startDay&endDay]'; Desc='Get chat by tag'} ,
+            @{ Method='GET'; Path='chat/{username}?authtoken&authtokentype[&startDay&endDay]'; Desc='Chat by username'} ,
+            @{ Method='POST'; Path='chat/next?authtoken&authtokentype[&numNextMessages]'; Desc='Next messages'} ,
+            @{ Method='POST'; Path='chat/previous?authtoken&authtokentype[&numPreviousMessages]'; Desc='Previous messages'} ,
+            @{ Method='GET'; Path='chat/sendChat?authtoken&authtokentype[&username&message]'; Desc='Send chat (GET)'}
+        )
+        'Command' = @(
+            @{ Method='POST'; Path='command/exec?authtoken&authtokentype'; Desc='Execute command'}
+        )
+        'Exporter' = @(
+            @{ Method='POST'; Path='exporter/all?authtoken&authtokentype'; Desc='Exporter all'} ,
+            @{ Method='POST'; Path='exporter/chat?authtoken&authtokentype'; Desc='Exporter chat'} ,
+            @{ Method='POST'; Path='exporter/species?authtoken&authtokentype'; Desc='Exporter species (POST)'} ,
+            @{ Method='GET';  Path='exporter/species?authtoken&authtokentype[&speciesName]'; Desc='Exporter species (GET)'} ,
+            @{ Method='POST'; Path='exporter/environment?authtoken&authtokentype'; Desc='Exporter environment (POST)'} ,
+            @{ Method='GET';  Path='exporter/environment?authtoken&authtokentype[&category&units&column]'; Desc='Exporter environment (GET)'} ,
+            @{ Method='POST'; Path='exporter/actions?authtoken&authtokentype'; Desc='Exporter actions (POST)'} ,
+            @{ Method='GET';  Path='exporter/actions?authtoken&authtokentype[&actionName]'; Desc='Exporter actions (GET)'} ,
+            @{ Method='GET';  Path='exporter/actionlist?authtoken&authtokentype'; Desc='Exporter action list'} ,
+            @{ Method='GET';  Path='exporter/specieslist?authtoken&authtokentype'; Desc='Exporter species list'} ,
+            @{ Method='GET';  Path='exporter/environmentlist?authtoken&authtokentype'; Desc='Exporter environment list'}
+        )
+        'Elections' = @(
+            @{ Method='GET'; Path='elections/titles'; Desc='Elections titles (optional ?state)'} ,
+            @{ Method='GET'; Path='elections'; Desc='Get elections (?returnActive)'} ,
+            @{ Method='GET'; Path='elections/{id}'; Desc='Get election by id'} ,
+            @{ Method='GET'; Path='elections/titles/{id}'; Desc='Get election title by id'} ,
+            @{ Method='GET'; Path='elections/votes'; Desc='Get votes (?id)'} ,
+            @{ Method='POST'; Path='elections/vote?authtoken&authtokentype[&forceVote]'; Desc='Vote'} ,
+            @{ Method='POST'; Path='elections/forceelectionend?authtoken&authtokentype[&electionId]'; Desc='Force election end'} ,
+            @{ Method='POST'; Path='elections/addcomment?authtoken&authtokentype[&electionId]'; Desc='Add election comment'} ,
+            @{ Method='GET'; Path='elections/listcomments[?electionId]'; Desc='List election comments'} ,
+            @{ Method='POST'; Path='elections/generatetestgovernment?authtoken&authtokentype'; Desc='Generate test government'} ,
+            @{ Method='POST'; Path='elections/generatetestdata?authtoken&authtokentype[&addUserVotes&addTwitchVotes]'; Desc='Generate test data'} ,
+            @{ Method='POST'; Path='elections/finishelection?authtoken&authtokentype'; Desc='Finish election'}
+        )
+        'Laws' = @(
+            @{ Method='GET'; Path='laws/byStates/{states}'; Desc='Laws by states'} ,
+            @{ Method='GET'; Path='laws'; Desc='Get laws'} ,
+            @{ Method='GET'; Path='laws/districtmap/{name}'; Desc='District map'} ,
+            @{ Method='GET'; Path='laws/{id}'; Desc='Law by id'} ,
+            @{ Method='POST'; Path='laws/generatetestdata?authtoken&authtokentype'; Desc='Generate laws test data'}
+        )
+        'Logs' = @(
+            @{ Method='GET'; Path='logs?authtoken&authtokentype'; Desc='Get logs'} ,
+            @{ Method='GET'; Path='logs/{category}?authtoken&authtokentype'; Desc='Logs by category'} ,
+            @{ Method='GET'; Path='logs/get?authtoken&authtokentype[&filepath]'; Desc='Get log file'}
+        )
+        'Map' = @(
+            @{ Method='GET'; Path='map/mapstats?authtoken&authtokentype'; Desc='Map stats'} ,
+            @{ Method='GET'; Path='map/entitytypes?authtoken&authtokentype'; Desc='Entity types'} ,
+            @{ Method='GET'; Path='map/entities?authtoken&authtokentype[&entityTypes&states]'; Desc='Map entities'} ,
+            @{ Method='GET'; Path='map/dimension?authtoken&authtokentype'; Desc='Map dimension'} ,
+            @{ Method='GET'; Path='map/layerList?authtoken&authtokentype'; Desc='Map layer list'} ,
+            @{ Method='GET'; Path='map/map.json?authtoken&authtokentype'; Desc='Map JSON'} ,
+            @{ Method='GET'; Path='map/waterLevel?authtoken&authtokentype'; Desc='Water level'} ,
+            @{ Method='GET'; Path='map/property?authtoken&authtokentype'; Desc='Map property'}
+        )
+        'Performance' = @(
+            @{ Method='GET'; Path='performance/performanceReport?authtoken&authtokentype'; Desc='Performance report'}
+        )
+        'Plugins' = @(
+            @{ Method='GET'; Path='plugins/config/{name}?authtoken&authtokentype'; Desc='Get plugin config'} ,
+            @{ Method='POST'; Path='plugins/config/{name}?authtoken&authtokentype'; Desc='Post plugin config'} ,
+            @{ Method='GET'; Path='plugins'; Desc='Plugins list'} ,
+            @{ Method='GET'; Path='plugins/web'; Desc='Plugins web'}
+        )
+        'Profiling' = @(
+            @{ Method='GET'; Path='profiling-results?authtoken&authtokentype'; Desc='Profiling results'} ,
+            @{ Method='GET'; Path='profiling-results/{filename}?authtoken&authtokentype'; Desc='Profiling file'}
+        )
+        'Misc' = @(
+            @{ Method='GET'; Path='info?authtoken&authtokentype'; Desc='Info'} ,
+            @{ Method='GET'; Path='frontpage?authtoken&authtokentype'; Desc='Frontpage'} ,
+            @{ Method='GET'; Path='admins?authtoken&authtokentype'; Desc='Admins'} ,
+            @{ Method='GET'; Path='isadmin?authtoken&authtokentype'; Desc='Is admin'}
+        )
+        'Datasets' = @(
+            @{ Method='GET'; Path='datasets/timerange?authtoken&authtokentype'; Desc='Datasets timerange'} ,
+            @{ Method='GET'; Path='datasets/treelist?authtoken&authtokentype'; Desc='Datasets tree list'} ,
+            @{ Method='GET'; Path='datasets/flatlist?authtoken&authtokentype'; Desc='Datasets flat list'} ,
+            @{ Method='GET'; Path='datasets/get?authtoken&authtokentype[&dataset&dayStart&dayEnd]'; Desc='Get dataset'} ,
+            @{ Method='GET'; Path='datasets/getlist?authtoken&authtokentype[&requestedSets&dayStart&dayEnd]'; Desc='Get datasets list'} ,
+            @{ Method='GET'; Path='datasets/graphs?authtoken&authtokentype'; Desc='Datasets graphs'} ,
+            @{ Method='GET'; Path='datasets/generatetestdata?authtoken&authtokentype[&days&users&generateClimateData&pollutionMultiplier]'; Desc='Generate datasets test data'}
+        )
+        'Users' = @(
+            @{ Method='GET'; Path='users?authtoken&authtokentype[&hoursPlayedGte]'; Desc='Users list'}
+        )
+        'WorldLayers' = @(
+            @{ Method='GET'; Path='worldlayers/layers?authtoken&authtokentype'; Desc='Layers list'} ,
+            @{ Method='GET'; Path='worldlayers/layers/{focusLayer}?authtoken&authtokentype[&minX&minY&maxX&maxY]'; Desc='Get layer region'} ,
+            @{ Method='GET'; Path='worldlayers/relationships/areadescription?authtoken&authtokentype[&minX&minY&maxX&maxY]'; Desc='Area descriptions'} ,
+            @{ Method='GET'; Path='worldlayers/relationships/{focusLayer}?authtoken&authtokentype[&minX&minY&maxX&maxY]'; Desc='Layer relationships'}
+        )
+    }
+}
+
+function Show-ApiMenu {
+    param()
+    Set-LastFunction
+    while ($true) {
+        Clear-Host
+        Write-Host '=== ECO WATCHDOG: Admin API Menu ===' -ForegroundColor Cyan
+        $apiRoot = $Config.ApiBase -replace '/+$',''
+        if (-not $apiRoot) { $apiRoot = ($Config.HealthUrl -replace '/+$','') }
+        if ($apiRoot -notmatch '/api/v1$') { $apiRoot = $apiRoot + '/api/v1' }
+        $displayBase = $Config.AdminApiBase -replace '/+$','' -or ($apiRoot + '/admin')
+        Write-Host "Server: $displayBase" -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host '1) Raw API request (method + path + optional JSON body)'
+        Write-Host '2) Set access (public/private/hidden)'
+        Write-Host '3) Get access'
+        Write-Host '4) Set server name'
+        Write-Host '5) Get server name'
+        Write-Host '6) Game export'
+        Write-Host '7) Show last API response'
+        Write-Host '8) Chat endpoints'
+        Write-Host '9) Command exec'
+        Write-Host '10) DataExport endpoints'
+        Write-Host '11) Browse all endpoints'
+        Write-Host 'Q) Back'
+        $choice = Read-Host 'Choose an option'
+        if ($choice -and $choice.ToUpper() -eq 'Q') { break }
+        switch ($choice.ToUpper()) {
+            '1' {
+                $method = Read-Host 'HTTP Method (GET/POST/PUT/DELETE) [GET]'
+                if (-not $method) { $method = 'GET' }
+                $path = Read-Host 'Relative path (e.g. get/status)'
+                if (-not $path) { $path = '/' }
+                $body = Read-Host 'Request body (JSON or empty)'
+                if ($body -and $body.Trim().Length -gt 0) { $bodyVal = $body } else { $bodyVal = $null }
+                $result = Invoke-AdminApi -Method $method -Path $path -Body $bodyVal
+                $script:LastApiResponse = $result
+                Write-Host '--- API RESPONSE ---' -ForegroundColor Cyan
+                $result -split "\r?\n" | ForEach-Object { Write-Host $_ }
+                Write-Host '--- END API RESPONSE ---' -ForegroundColor Cyan
+                Write-Host ''
+                Write-Host 'Press Enter to continue...'
+                [void][System.Console]::ReadKey($true)
+            }
+            '2' {
+                # Set access
+                $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
+                if (-not $token) { $token = $Config.ApiAuthToken }
+                $tokentype = 'eco'
+                $value = Read-Host "value (public/private/hidden) [public]"
+                if (-not $value) { $value = 'public' }
+                $password = $null
+                if ($value -eq 'private') { $password = Read-Host 'password (for private)' }
+                $q = "set/access?api_key=$([uri]::EscapeDataString($token))&value=$([uri]::EscapeDataString($value))"
+                if ($password) { $q += "&password=$([uri]::EscapeDataString($password))" }
+                $result = Invoke-AdminApi -Method 'POST' -Path $q
+                $script:LastApiResponse = $result
+                Write-Host '--- API RESPONSE ---' -ForegroundColor Cyan
+                $result -split "\r?\n" | ForEach-Object { Write-Host $_ }
+                Write-Host '--- END API RESPONSE ---' -ForegroundColor Cyan
+                Write-Host 'Press Enter to continue...'
+                [void][System.Console]::ReadKey($true)
+            }
+            '3' {
+                $token = Read-Host "api_key (leave blank to use Config.AdminApiToken)"
+                if (-not $token) { $token = $Config.AdminApiToken }
+                $tokentype = 'eco'
+                $q = "get/access?api_key=$([uri]::EscapeDataString($token))"
+                $result = Invoke-AdminApi -Method 'GET' -Path $q
+                $script:LastApiResponse = $result
+                Write-Host '--- API RESPONSE ---' -ForegroundColor Cyan
+                $result -split "\r?\n" | ForEach-Object { Write-Host $_ }
+                Write-Host '--- END API RESPONSE ---' -ForegroundColor Cyan
+                Write-Host 'Press Enter to continue...'
+                [void][System.Console]::ReadKey($true)
+            }
+            '4' {
+                $token = Read-Host "api_key (leave blank to use Config.AdminApiToken)"
+                if (-not $token) { $token = $Config.AdminApiToken }
+                $tokentype = 'eco'
+                $name = Read-Host 'Server name (URL-unsafe characters will be escaped)'
+                $q = "set/servername?api_key=$([uri]::EscapeDataString($token))&name=$([uri]::EscapeDataString($name))"
+                $result = Invoke-AdminApi -Method 'POST' -Path $q
+                $script:LastApiResponse = $result
+                Write-Host '--- API RESPONSE ---' -ForegroundColor Cyan
+                $result -split "\r?\n" | ForEach-Object { Write-Host $_ }
+                Write-Host '--- END API RESPONSE ---' -ForegroundColor Cyan
+                Write-Host 'Press Enter to continue...'
+                [void][System.Console]::ReadKey($true)
+            }
+            '5' {
+                $result = Invoke-AdminApi -Method 'GET' -Path 'get/servername'
+                $script:LastApiResponse = $result
+                Write-Host '--- API RESPONSE ---' -ForegroundColor Cyan
+                $result -split "\r?\n" | ForEach-Object { Write-Host $_ }
+                Write-Host '--- END API RESPONSE ---' -ForegroundColor Cyan
+                Write-Host 'Press Enter to continue...'
+                [void][System.Console]::ReadKey($true)
+            }
+            '6' {
+                $token = Read-Host "api_key (leave blank to use Config.AdminApiToken)"
+                if (-not $token) { $token = $Config.AdminApiToken }
+                $tokentype = 'eco'
+                $q = "game/export?api_key=$([uri]::EscapeDataString($token))"
+                $result = Invoke-AdminApi -Method 'POST' -Path $q
+                $script:LastApiResponse = $result
+                Write-Host '--- API RESPONSE ---' -ForegroundColor Cyan
+                $result -split "\r?\n" | ForEach-Object { Write-Host $_ }
+                Write-Host '--- END API RESPONSE ---' -ForegroundColor Cyan
+                Write-Host 'Press Enter to continue...'
+                [void][System.Console]::ReadKey($true)
+            }
+            '7' {
+                if ($script:LastApiResponse) {
+                    Write-Host '--- LAST API RESPONSE ---' -ForegroundColor Cyan
+                    $script:LastApiResponse -split "\r?\n" | ForEach-Object { Write-Host $_ }
+                    Write-Host '--- END LAST API RESPONSE ---' -ForegroundColor Cyan
+                } else { Write-Host '(No previous API response)' }
+                Write-Host 'Press Enter to continue...'
+                [void][System.Console]::ReadKey($true)
+            }
+            '8' {
+                # Chat submenu
+                while ($true) {
+                    $exitSubmenu = $false
+                    Clear-Host
+                    Write-Host '--- Chat API ---' -ForegroundColor Cyan
+                    Write-Host '1) Get chat (time range)'
+                    Write-Host '2) Get chat by tag'
+                    Write-Host '3) Get chat messages by user'
+                    Write-Host '4) Get next messages (POST)'
+                    Write-Host '5) Get previous messages (POST)'
+                    Write-Host '6) Send chat (debug-only)'
+                    Write-Host 'B) Back'
+                    Write-Host 'Choice' -NoNewline
+                    $ckey = [Console]::ReadKey($true).Key.ToString()
+                    if ($ckey.Length -gt 1 -and $ckey.StartsWith('D') -and $ckey.Length -eq 2) { $ckey = $ckey.Substring(1) }
+                    $c = $ckey.Substring(0,1).ToUpper()
+                    Write-Host ''
+                    switch ($c.ToUpper()) {
+                        '1' {
+                            $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
+                            if (-not $token) { $token = $Config.ApiAuthToken }
+                            $tokentype = 'eco'
+                            $start = Read-Host 'startDay [0]'
+                            if (-not $start) { $start = '0' }
+                            $end = Read-Host 'endDay [-1]'
+                            if (-not $end) { $end = '-1' }
+                            $q = "chat?api_key=$([uri]::EscapeDataString($token))&startDay=$([uri]::EscapeDataString($start))&endDay=$([uri]::EscapeDataString($end))"
+                            $result = Invoke-GameApi -Method 'GET' -Path $q
+                            $script:LastApiResponse = $result
+                            Write-Host $result
+                            Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
+                        }
+                        '2' {
+                            $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
+                            if (-not $token) { $token = $Config.ApiAuthToken }
+                            $tokentype = 'eco'
+                            $tag = Read-Host 'tag'
+                            $start = Read-Host 'startDay [0]'
+                            if (-not $start) { $start = '0' }
+                            $end = Read-Host 'endDay [-1]'
+                            if (-not $end) { $end = '-1' }
+                            $q = "chat/tag?api_key=$([uri]::EscapeDataString($token))&tag=$([uri]::EscapeDataString($tag))&startDay=$([uri]::EscapeDataString($start))&endDay=$([uri]::EscapeDataString($end))"
+                            $result = Invoke-GameApi -Method 'GET' -Path $q
+                            $script:LastApiResponse = $result
+                            Write-Host $result
+                            Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
+                        }
+                        '3' {
+                            $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
+                            if (-not $token) { $token = $Config.ApiAuthToken }
+                            $tokentype = 'eco'
+                            $user = Read-Host 'username'
+                            $start = Read-Host 'startDay [0]'
+                            if (-not $start) { $start = '0' }
+                            $end = Read-Host 'endDay [-1]'
+                            if (-not $end) { $end = '-1' }
+                            $q = "chat/$([uri]::EscapeDataString($user))?api_key=$([uri]::EscapeDataString($token))&startDay=$([uri]::EscapeDataString($start))&endDay=$([uri]::EscapeDataString($end))"
+                            $result = Invoke-GameApi -Method 'GET' -Path $q
+                            $script:LastApiResponse = $result
+                            Write-Host $result
+                            Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
+                        }
+                        '4' {
+                            $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
+                            if (-not $token) { $token = $Config.ApiAuthToken }
+                            $tokentype = 'eco'
+                            $num = Read-Host 'numNextMessages [1]'
+                            if (-not $num) { $num = '1' }
+                            Write-Host 'Paste message JSON body (single line) and press Enter:'
+                            $body = Read-Host
+                            $q = "chat/next?api_key=$([uri]::EscapeDataString($token))&numNextMessages=$([uri]::EscapeDataString($num))"
+                            $result = Invoke-GameApi -Method 'POST' -Path $q -Body $body
+                            $script:LastApiResponse = $result
+                            Write-Host $result
+                            Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
+                        }
+                        '5' {
+                            $token = Read-Host "api_key (leave blank to use Config.AdminApiToken)"
+                            if (-not $token) { $token = $Config.AdminApiToken }
+                            $tokentype = 'eco'
+                            $num = Read-Host 'numPreviousMessages [1]'
+                            if (-not $num) { $num = '1' }
+                            Write-Host 'Paste message JSON body (single line) and press Enter:'
+                            $body = Read-Host
+                            $q = "chat/previous?api_key=$([uri]::EscapeDataString($token))&numPreviousMessages=$([uri]::EscapeDataString($num))"
+                            $result = Invoke-GameApi -Method 'POST' -Path $q -Body $body
+                            $script:LastApiResponse = $result
+                            Write-Host $result
+                            Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
+                        }
+                        '6' {
+                            $token = Read-Host "api_key (leave blank to use Config.AdminApiToken)"
+                            if (-not $token) { $token = $Config.AdminApiToken }
+                            $tokentype = 'eco'
+                            $user = Read-Host 'username'
+                            $msg = Read-Host 'message'
+                            $q = "chat/sendChat?api_key=$([uri]::EscapeDataString($token))&username=$([uri]::EscapeDataString($user))&message=$([uri]::EscapeDataString($msg))"
+                            $result = Invoke-GameApi -Method 'GET' -Path $q
+                            $script:LastApiResponse = $result
+                            Write-Host $result
+                            Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
+                        }
+                        'B' { $exitSubmenu = $true; break }
+                        default { Write-Host 'Unknown choice'; Start-Sleep -Seconds 1 }
+                    }
+                    if ($exitSubmenu) { break }
+                }
+            }
+            '9' {
+                # Command exec
+                $token = Read-Host "api_key (leave blank to use Config.AdminApiToken)"
+                if (-not $token) { $token = $Config.AdminApiToken }
+                $tokentype = 'eco'
+                Write-Host 'Paste command body JSON (or plain text) and press Enter:'
+                $body = Read-Host
+                $q = "command/exec?api_key=$([uri]::EscapeDataString($token))"
+                $result = Invoke-GameApi -Method 'POST' -Path $q -Body $body
+                $script:LastApiResponse = $result
+                Write-Host $result
+                Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
+            }
+            '10' {
+                # DataExport submenu
+                while ($true) {
+                    $exitSubmenu = $false
+                    Clear-Host
+                    Write-Host '--- DataExport API ---' -ForegroundColor Cyan
+                    Write-Host '1) Export all (POST)'
+                    Write-Host '2) Export chat (POST)'
+                    Write-Host '3) Export species (POST)'
+                    Write-Host '4) Get species (GET)'
+                    Write-Host '5) Export environment (POST)'
+                    Write-Host '6) Get environment (GET)'
+                    Write-Host '7) Export actions (POST)'
+                    Write-Host '8) Get action (GET)'
+                    Write-Host '9) Get action list (GET)'
+                    Write-Host '10) Get species list (GET)'
+                    Write-Host '11) Get environment list (GET)'
+                    Write-Host 'B) Back'
+                    Write-Host 'Choice' -NoNewline
+                    $dkey = [Console]::ReadKey($true).Key.ToString()
+                    if ($dkey.Length -gt 1 -and $dkey.StartsWith('D') -and $dkey.Length -eq 2) { $dkey = $dkey.Substring(1) }
+                    $d = $dkey.Substring(0,1).ToUpper()
+                    Write-Host ''
+                    switch ($d.ToUpper()) {
+                        '1' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/all?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '2' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/chat?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '3' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/species?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '4' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $spec = Read-Host 'speciesName (optional)'; $q = "exporter/species?api_key=$([uri]::EscapeDataString($token))"; if ($spec) { $q += "&speciesName=$([uri]::EscapeDataString($spec))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '5' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/environment?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '6' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $cat = Read-Host 'category (optional)'; $units = Read-Host 'units (optional)'; $col = Read-Host 'column (optional)'; $q = "exporter/environment?api_key=$([uri]::EscapeDataString($token))"; if ($cat) { $q += "&category=$([uri]::EscapeDataString($cat))" }; if ($units) { $q += "&units=$([uri]::EscapeDataString($units))" }; if ($col) { $q += "&column=$([uri]::EscapeDataString($col))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '7' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/actions?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '8' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $action = Read-Host 'actionName (optional)'; $q = "exporter/actions?api_key=$([uri]::EscapeDataString($token))"; if ($action) { $q += "&actionName=$([uri]::EscapeDataString($action))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '9' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/actionlist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '10' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/specieslist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '11' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/environmentlist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        'B' { $exitSubmenu = $true; break }
+                        default { Write-Host 'Unknown choice'; Start-Sleep -Seconds 1 }
+                    }
+                    if ($exitSubmenu) { break }
+                }
+            }
+            '11' {
+                $groups = Get-ApiEndpoints
+                $keys = $groups.Keys | Sort-Object
+                Clear-Host
+                Write-Host '--- API Endpoint Groups ---' -ForegroundColor Cyan
+                for ($i=0; $i -lt $keys.Count; $i++) { Write-Host "[$($i+1)] $($keys[$i])" }
+                $gchoice = Read-Host 'Choose a group number (blank to cancel)'
+                if (-not $gchoice) { break }
+                $gi = [int]$gchoice - 1
+                if ($gi -lt 0 -or $gi -ge $keys.Count) { Write-Host 'Invalid group'; Start-Sleep -Seconds 1; break }
+                $groupName = $keys[$gi]
+                $endpoints = $groups[$groupName]
+                Clear-Host
+                Write-Host "--- Endpoints: $groupName ---" -ForegroundColor Cyan
+                for ($j=0; $j -lt $endpoints.Count; $j++) { Write-Host "[$($j+1)] $($endpoints[$j].Method) $($endpoints[$j].Path) - $($endpoints[$j].Desc)" }
+                $echoice = Read-Host 'Choose an endpoint number (blank to cancel)'
+                if (-not $echoice) { break }
+                $ei = [int]$echoice - 1
+                if ($ei -lt 0 -or $ei -ge $endpoints.Count) { Write-Host 'Invalid endpoint'; Start-Sleep -Seconds 1; break }
+                $ep = $endpoints[$ei]
+                Write-Host "Selected: $($ep.Method) $($ep.Path) - $($ep.Desc)" -ForegroundColor Yellow
+                $finalPath = Resolve-ApiTemplate -Template $ep.Path
+                Write-Host "Resolved path: $finalPath" -ForegroundColor Green
+                $edit = Read-Host 'Edit final path before sending? (y/N)'
+                if ($edit -and $edit.ToLower().StartsWith('y')) { $finalPath = Read-Host "Final path (edit as needed)" }
+                $bodyVal = $null
+                if ($ep.Method -match 'POST|PUT') { $body = Read-Host 'Request body (JSON) or leave blank'; if ($body -and $body.Trim().Length -gt 0) { $bodyVal = $body } }
+                if ($finalPath -match '^admin/' -or $ep.Path -match '^admin/') {
+                    $result = Invoke-AdminApi -Method $ep.Method -Path $finalPath -Body $bodyVal
+                } else {
+                    $result = Invoke-GameApi -Method $ep.Method -Path $finalPath -Body $bodyVal
+                }
+                $script:LastApiResponse = $result
+                try { $obj = $result | ConvertFrom-Json -ErrorAction Stop; $pretty = $obj | ConvertTo-Json -Depth 10; Write-Host $pretty } catch { Write-Host $result }
+                Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
+            }
+            'Q' { break }
+            default { Write-Host 'Unknown choice' }
+        }
+    }
+    Clear-Host; $script:UIInitialized = $false; Show-UI -Force
+}
+
 function Show-UI {
     param([switch]$Force)
 
@@ -1139,6 +1711,15 @@ function Start-Watchdog {
                         } catch {
                             Write-Log "RCON command failed: $_" 'ERROR'
                             $global:LastAction = "RCON failed: $_"
+                        }
+                    }
+                    'Api' {
+                        $global:LastAction = "Manual API command at $(Get-Date)"
+                        try {
+                            Show-ApiMenu
+                        } catch {
+                            Write-Log "API menu failed: $_" 'ERROR'
+                            $global:LastAction = "API failed: $_"
                         }
                     }
                     'Back'   { Clear-Host; $script:UIInitialized = $false; $script:DisplayMode = 'UI'; $script:LogInitialized = $false }
