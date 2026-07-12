@@ -1016,6 +1016,7 @@ function Invoke-AdminApi {
     elseif ($Config.ApiAuthToken) { $headers['X-API-Key'] = $Config.ApiAuthToken }
 
     $invokeParams = @{ Uri = $url; Method = $Method; Headers = $headers; ErrorAction = 'Stop' }
+    try { Write-Log "API Request: $Method $url" 'DEBUG' } catch {}
     if ($null -ne $Body -and $Body -ne '') {
         if ($Body -isnot [string]) { $bodyJson = $Body | ConvertTo-Json -Depth 10 } else { $bodyJson = $Body }
         $invokeParams['Body'] = $bodyJson
@@ -1051,6 +1052,7 @@ function Invoke-GameApi {
     if ($Config.ApiAuthToken) { $headers['X-API-Key'] = $Config.ApiAuthToken } elseif ($Config.AdminApiToken) { $headers['X-API-Key'] = $Config.AdminApiToken }
 
     $invokeParams = @{ Uri = $url; Method = $Method; Headers = $headers; ErrorAction = 'Stop' }
+    try { Write-Log "API Request: $Method $url" 'DEBUG' } catch {}
     if ($null -ne $Body -and $Body -ne '') {
         if ($Body -isnot [string]) { $bodyJson = $Body | ConvertTo-Json -Depth 10 } else { $bodyJson = $Body }
         $invokeParams['Body'] = $bodyJson
