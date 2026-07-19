@@ -231,8 +231,8 @@ function Import-UsersApiTokens {
     try {
         $raw = Get-Content -Path $usersCfg -Raw -ErrorAction Stop
         $obj = $raw | ConvertFrom-Json -ErrorAction Stop
-        if (-not $Config.ApiAuthToken -and $obj.APIAuthToken) {
-            $Config.ApiAuthToken = $obj.APIAuthToken
+        if (-not $Config.APIAdminAuthToken -and $obj.APIAuthToken) {
+            $Config.APIAdminAuthToken = $obj.APIAuthToken
             Write-Log 'Loaded APIAuthToken from Configs/Users.eco' 'DEBUG'
         }
         if (-not $Config.AdminApiToken -and $obj.APIAdminAuthToken) {
@@ -1013,7 +1013,7 @@ function Invoke-AdminApi {
 
     $headers = @{}
     if ($Config.AdminApiToken) { $headers['X-API-Key'] = $Config.AdminApiToken }
-    elseif ($Config.ApiAuthToken) { $headers['X-API-Key'] = $Config.ApiAuthToken }
+    elseif ($Config.APIAdminAuthToken) { $headers['X-API-Key'] = $Config.APIAdminAuthToken }
 
     $invokeParams = @{ Uri = $url; Method = $Method; Headers = $headers; ErrorAction = 'Stop' }
     try { Write-Log "API Request: $Method $url" 'DEBUG' } catch {}
@@ -1049,7 +1049,7 @@ function Invoke-GameApi {
     $url = ($base -replace '/+$','') + '/' + ($Path -replace '^/+','')
 
     $headers = @{}
-    if ($Config.ApiAuthToken) { $headers['X-API-Key'] = $Config.ApiAuthToken } elseif ($Config.AdminApiToken) { $headers['X-API-Key'] = $Config.AdminApiToken }
+    if ($Config.APIAdminAuthToken) { $headers['X-API-Key'] = $Config.APIAdminAuthToken } elseif ($Config.AdminApiToken) { $headers['X-API-Key'] = $Config.AdminApiToken }
 
     $invokeParams = @{ Uri = $url; Method = $Method; Headers = $headers; ErrorAction = 'Stop' }
     try { Write-Log "API Request: $Method $url" 'DEBUG' } catch {}
@@ -1068,24 +1068,63 @@ function Invoke-GameApi {
     }
 }
 
-# Resolve a template by filling common placeholders (`authtoken`, `authtokentype`) and return a path string
+# Resolve required placeholders
 function Resolve-ApiTemplate {
     param(
         [string]$Template
     )
     Set-LastFunction
     $template = $Template
-    # For API tokens, use `api_key` query parameter (or X-API-Key header). Replace 'authtoken' placeholders
-    if ($template -match 'authtoken') {
-        $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
-        if (-not $token) { $token = $Config.ApiAuthToken }
+    # For API tokens, use `api_key` query parameter (or X-API-Key header). Replace placeholders
+    if ($template -match '\bauthtoken\b') {
+        $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"
+        if (-not $token) { $token = $Config.APIAdminAuthToken }
         $enc = [uri]::EscapeDataString($token)
-        # Replace literal 'authtoken' placeholder with 'api_key=<encoded>' and remove authtokentype placeholders
-        $template = $template -replace 'authtoken', "api_key=$enc"
-        $template = $template -replace '([&?])?authtokentype([^&\]]*)', ''
+        $template = $template -replace '\bauthtokentype\b', ''
+        $template = $template -replace '\bauthtoken\b', "api_key=$enc"
     }
-    # Remove any leftover authtokentype tokens if present
-    $template = $template -replace 'authtokentype', ''
+
+    # Resolve optional parameter groups: [...]
+    $template = [regex]::Replace(
+        $template,
+        '\[([^\]]+)\]',
+        {
+            param($match)
+
+            $contents = $match.Groups[1].Value
+
+            $parameters = $contents.TrimStart('&').Split('&')
+
+            $result = @()
+
+            foreach ($parameter in $parameters) {
+
+                if ([string]::IsNullOrWhiteSpace($parameter)) {
+                    continue
+                }
+
+                $value = Read-Host "$parameter (optional)"
+
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    $result += "$parameter=$([uri]::EscapeDataString($value))"
+                }
+            }
+
+            if ($result.Count -gt 0) {
+                '&' + ($result -join '&')
+            }
+            else {
+                ''
+            }
+        }
+    )
+
+    # Cleanup
+    $template = $template -replace '\?&', '?'
+    $template = $template -replace '&&+', '&'
+    $template = $template -replace '\?$', ''
+    $template = $template -replace '&$', ''
+
     return $template
 }
 
@@ -1245,8 +1284,8 @@ function Show-ApiMenu {
             }
             '2' {
                 # Set access
-                $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
-                if (-not $token) { $token = $Config.ApiAuthToken }
+                $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"
+                if (-not $token) { $token = $Config.APIAdminAuthToken }
                 $tokentype = 'eco'
                 $value = Read-Host "value (public/private/hidden) [public]"
                 if (-not $value) { $value = 'public' }
@@ -1340,8 +1379,8 @@ function Show-ApiMenu {
                     Write-Host ''
                     switch ($c.ToUpper()) {
                         '1' {
-                            $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
-                            if (-not $token) { $token = $Config.ApiAuthToken }
+                            $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"
+                            if (-not $token) { $token = $Config.APIAdminAuthToken }
                             $tokentype = 'eco'
                             $start = Read-Host 'startDay [0]'
                             if (-not $start) { $start = '0' }
@@ -1354,8 +1393,8 @@ function Show-ApiMenu {
                             Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
                         }
                         '2' {
-                            $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
-                            if (-not $token) { $token = $Config.ApiAuthToken }
+                            $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"
+                            if (-not $token) { $token = $Config.APIAdminAuthToken }
                             $tokentype = 'eco'
                             $tag = Read-Host 'tag'
                             $start = Read-Host 'startDay [0]'
@@ -1369,8 +1408,8 @@ function Show-ApiMenu {
                             Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
                         }
                         '3' {
-                            $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
-                            if (-not $token) { $token = $Config.ApiAuthToken }
+                            $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"
+                            if (-not $token) { $token = $Config.APIAdminAuthToken }
                             $tokentype = 'eco'
                             $user = Read-Host 'username'
                             $start = Read-Host 'startDay [0]'
@@ -1384,8 +1423,8 @@ function Show-ApiMenu {
                             Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true)
                         }
                         '4' {
-                            $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"
-                            if (-not $token) { $token = $Config.ApiAuthToken }
+                            $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"
+                            if (-not $token) { $token = $Config.APIAdminAuthToken }
                             $tokentype = 'eco'
                             $num = Read-Host 'numNextMessages [1]'
                             if (-not $num) { $num = '1' }
@@ -1466,17 +1505,17 @@ function Show-ApiMenu {
                     $d = $dkey.Substring(0,1).ToUpper()
                     Write-Host ''
                     switch ($d.ToUpper()) {
-                        '1' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/all?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '2' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/chat?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '3' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/species?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '4' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $spec = Read-Host 'speciesName (optional)'; $q = "exporter/species?api_key=$([uri]::EscapeDataString($token))"; if ($spec) { $q += "&speciesName=$([uri]::EscapeDataString($spec))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '5' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/environment?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '6' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $cat = Read-Host 'category (optional)'; $units = Read-Host 'units (optional)'; $col = Read-Host 'column (optional)'; $q = "exporter/environment?api_key=$([uri]::EscapeDataString($token))"; if ($cat) { $q += "&category=$([uri]::EscapeDataString($cat))" }; if ($units) { $q += "&units=$([uri]::EscapeDataString($units))" }; if ($col) { $q += "&column=$([uri]::EscapeDataString($col))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '7' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/actions?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '8' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $action = Read-Host 'actionName (optional)'; $q = "exporter/actions?api_key=$([uri]::EscapeDataString($token))"; if ($action) { $q += "&actionName=$([uri]::EscapeDataString($action))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '9' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/actionlist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '10' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/specieslist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
-                        '11' { $token = Read-Host "api_key (leave blank to use Config.ApiAuthToken)"; if (-not $token) { $token = $Config.ApiAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/environmentlist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '1' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/all?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '2' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/chat?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '3' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/species?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '4' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $spec = Read-Host 'speciesName (optional)'; $q = "exporter/species?api_key=$([uri]::EscapeDataString($token))"; if ($spec) { $q += "&speciesName=$([uri]::EscapeDataString($spec))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '5' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/environment?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '6' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $cat = Read-Host 'category (optional)'; $units = Read-Host 'units (optional)'; $col = Read-Host 'column (optional)'; $q = "exporter/environment?api_key=$([uri]::EscapeDataString($token))"; if ($cat) { $q += "&category=$([uri]::EscapeDataString($cat))" }; if ($units) { $q += "&units=$([uri]::EscapeDataString($units))" }; if ($col) { $q += "&column=$([uri]::EscapeDataString($col))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '7' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/actions?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'POST' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '8' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $action = Read-Host 'actionName (optional)'; $q = "exporter/actions?api_key=$([uri]::EscapeDataString($token))"; if ($action) { $q += "&actionName=$([uri]::EscapeDataString($action))" }; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '9' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/actionlist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '10' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/specieslist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
+                        '11' { $token = Read-Host "api_key (leave blank to use Config.APIAdminAuthToken)"; if (-not $token) { $token = $Config.APIAdminAuthToken }; $tokentype = Read-Host "authtokentype [eco]"; if (-not $tokentype) { $tokentype = 'eco' }; $q = "exporter/environmentlist?api_key=$([uri]::EscapeDataString($token))"; $result = Invoke-GameApi -Method 'GET' -Path $q; $script:LastApiResponse = $result; Write-Host $result; Write-Host 'Press Enter to continue...'; [void][System.Console]::ReadKey($true) }
                         'B' { $exitSubmenu = $true; break }
                         default { Write-Host 'Unknown choice'; Start-Sleep -Seconds 1 }
                     }
