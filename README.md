@@ -13,7 +13,7 @@ and a state machine implemented in EcoWatchdog.ps1.
 - Optional: Pester (for running unit tests)
 
 **Quick start**
-- Place this repository inside your Eco server folder (the directory that contains `EcoServer.exe`). Ensure `EcoWatchdog.ps1` and `EcoWatchdog.bat` are located in the same directory as `EcoServer.exe` so the watchdog can control the server process and access game files.
+- Place this repository inside your Eco server folder (the directory that contains `EcoServer.exe`). Ensure [`EcoWatchdog.ps1`](https://github.com/valzargaming/EcoWatchdog-PS/blob/master/EcoWatchdog.ps1) and [`EcoWatchdog.bat`](https://github.com/valzargaming/EcoWatchdog-PS/blob/master/EcoWatchdog.bat) are located in the same directory as `EcoServer.exe` so the watchdog can control the server process and access game files.
 - Run the watchdog on Windows using the provided batch wrapper:
 
 ```powershell
@@ -38,16 +38,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_tests.ps1
 - Do NOT commit secrets (RCON passwords) into the repository.
 
 **Important scripts**
-- `EcoWatchdog.ps1` — main watchdog implementation (state machine, RCON clients, backups, rotation)
-- `EcoWatchdog.bat` — Windows wrapper to start the watchdog script
-- `scripts/*` — utility scripts (maintenance scheduling, RCON diagnostics, graceful stop/restart helpers)
-- `tests/*` — Pester unit and integration tests
+- [`EcoWatchdog.ps1`](https://github.com/valzargaming/EcoWatchdog-PS/blob/master/EcoWatchdog.ps1) — main watchdog implementation (state machine, RCON clients, backups, rotation)
+- [`EcoWatchdog.bat`](https://github.com/valzargaming/EcoWatchdog-PS/blob/master/EcoWatchdog.bat) — Windows wrapper to start the watchdog script
+- [`scripts/*`](https://github.com/valzargaming/EcoWatchdog-PS/tree/master/scripts) — utility scripts (maintenance scheduling, RCON diagnostics, graceful stop/restart helpers)
+- [`tests/*`](https://github.com/valzargaming/EcoWatchdog-PS/tree/master/tests) — Pester unit and integration tests
 
 **Repository hygiene**
-- The `.gitignore` is configured to avoid tracking server binaries, game data, and backups. Only track scripts, tests, and project files.
+- The [`.gitignore`](https://github.com/valzargaming/EcoWatchdog-PS/blob/master/.gitignore) is configured to avoid tracking server binaries, game data, and backups. Only track scripts, tests, and project files.
 
 **Contributing & Support**
 - Open an issue or pull request with changes. Keep secrets out of commits.
 
 **License**
-- This project is available under the MIT License — see `LICENSE`.
+- This project is available under the MIT License — see [`LICENSE`](https://github.com/valzargaming/EcoWatchdog-PS/blob/master/LICENSE).
